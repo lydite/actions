@@ -1,0 +1,55 @@
+# ci-test — this file is yours.
+#
+# gt created it once and will never modify or delete it again.
+#
+# This repository ships composite actions, not a program, so "test" means:
+# every action.yml still parses and still declares what a composite action is
+# required to declare. That is a low bar, but it is the bar that catches the
+# failure that actually happens here — a YAML edit that breaks every consumer's
+# workflow at once, with no local build step to catch it first.
+#
+# TODO: add actionlint, pinned to an exact version and verified by checksum the
+# way lydite pins every tool it runs.
+name: ci-test
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: validate composite actions
+        run: |
+          python3 - <<'PY'
+          import glob, sys, yaml
+
+          found = glob.glob("*/action.yml") + glob.glob("*/action.yaml")
+          if not found:
+              sys.exit("no action.yml found — this check is testing nothing")
+
+          bad = 0
+          for f in found:
+              try:
+                  doc = yaml.safe_load(open(f))
+              except Exception as e:
+                  print(f"::error file={f}::not valid YAML: {e}"); bad += 1; continue
+              for key in ("name", "description", "runs"):
+                  if key not in doc:
+                      print(f"::error file={f}::missing required key '{key}'"); bad += 1
+              runs = doc.get("runs") or {}
+              if runs.get("using") != "composite":
+                  print(f"::error file={f}::runs.using must be 'composite', got {runs.get('using')!r}"); bad += 1
+              for i, step in enumerate(runs.get("steps") or []):
+                  if "run" in step and "shell" not in step:
+                      print(f"::error file={f}::step {i} ('{step.get('name','?')}') has 'run' without 'shell'"); bad += 1
+              print(f"ok  {f}  ({len(runs.get('steps') or [])} steps)")
+
+          sys.exit(1 if bad else 0)
+          PY

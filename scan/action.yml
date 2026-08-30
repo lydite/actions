@@ -1,0 +1,330 @@
+name: lydite
+description: Install lydite, run scan/coverage, post a PR summary, and report to Semgrep AppSec Platform / Codecov
+
+inputs:
+  version:
+    description: lydite version to install (omit or set to "latest" for the latest release)
+    default: latest
+  dir:
+    description: >
+      directory to scan (passed to lydite's --dir). This stays an input and
+      cannot move into .lydite.yml: that file lives AT the scan root, so
+      lydite has to be told the root before it can read its own config.
+    default: "."
+  run-scan:
+    description: >
+      run `lydite scan`. On pull_request events this scopes Semgrep to the PR's own diff, which
+      requires the calling workflow's checkout step to use `fetch-depth: 0` (lydite resolves the
+      merge-base with origin/main to do so).
+    default: "true"
+  run-coverage:
+    description: >
+      run `lydite coverage`. Requires the calling workflow's checkout step to use
+      `fetch-depth: 0` (lydite needs full history to resolve the PR's base commit and to check
+      out historical commits for baseline computation), and `contents: write` permission to cache
+      baselines on the lydite branch — a failure to cache is non-fatal (best-effort), but a
+      failure to even diff coverage is not.
+    default: "true"
+  # Removed in favour of .lydite.yml at the scan root: tests-mode, go-report,
+  # rust-report, rust-lcov-report. Who produces coverage is a property of how
+  # a repo's pipeline is built — the same answer for every workflow that calls
+  # this action — so it belongs in the repo's own config file, not restated at
+  # each call site. The replacements are:
+  #
+  #   coverage:
+  #     source: report        # was tests-mode: skip ("run" is still the default)
+  #     go:
+  #       report: coverage.out
+  #     rust:
+  #       report: coverage/llvm-cov.json
+  #       lcov: coverage/lcov.info
+  #
+  # Each report key also accepts a mapping of unit dir to path for a repo with
+  # more than one Go module or Rust crate, which is what the newline-separated
+  # "<dir>=<path>" input encoding was straining to express. Most repos need
+  # neither: the conventional per-unit paths are searched without configuration.
+  semgrep-app-token:
+    description: >
+      Semgrep AppSec Platform token. When set, lydite's Semgrep check runs `semgrep ci` instead
+      of `semgrep scan` — Semgrep's own diff-aware CI mode, which also uploads results to the
+      platform dashboard. Omit to keep Semgrep local-only (today's default behavior).
+    required: false
+  codecov-token:
+    description: >
+      Codecov upload token. When set, uploads whatever coverage report(s) and JUnit test-result
+      file(s) lydite found/produced to Codecov for its dashboard/history/PR-comment —
+      non-blocking, purely informational; the actual pass/fail coverage gate is lydite coverage
+      itself, not Codecov.
+    required: false
+  github-token:
+    description: token used to post/update the PR summary comment (needs pull-requests:write)
+    default: ${{ github.token }}
+
+runs:
+  using: composite
+  steps:
+    - name: Install lydite
+      shell: bash
+      env:
+        VERSION: ${{ inputs.version }}
+      run: |
+        # install.sh is always fetched from the latest release; LYDITE_VERSION
+        # pins which lydite binary it installs. install.sh itself verifies the
+        # downloaded binary's SHA-256 against the release's checksums.txt
+        # before installing it. install.sh is fetched to a file and executed
+        # as a separate step (not piped straight from curl into sh) so the
+        # full script is downloaded atomically before anything runs.
+        if [[ "${VERSION}" != "latest" ]]; then
+          export LYDITE_VERSION="${VERSION}"
+        fi
+        export LYDITE_INSTALL_DIR="${RUNNER_TEMP}/lydite-bin"
+        curl -fsSL -o "${RUNNER_TEMP}/lydite-install.sh" https://github.com/lydite/lydite/releases/latest/download/install.sh
+        sh "${RUNNER_TEMP}/lydite-install.sh"
+        echo "${LYDITE_INSTALL_DIR}" >> "$GITHUB_PATH"
+
+    - name: lydite scan
+      if: inputs.run-scan == 'true'
+      id: scan
+      shell: bash
+      env:
+        SEMGREP_APP_TOKEN: ${{ inputs.semgrep-app-token }}
+        DIR: ${{ inputs.dir }}
+        # On a PR, scope Semgrep to what the PR introduces. With a token that's
+        # already what `semgrep ci` does and lydite ignores this; without one
+        # (GitHub withholds secrets from Dependabot events, so every Dependabot
+        # PR lands here) it's what stops the token-less `semgrep scan` fallback
+        # from blocking on the repo's pre-existing findings — findings the PR
+        # never touched, and that no token-bearing run has ever reported.
+        # Requires the caller's checkout to have full history (fetch-depth: 0);
+        # lydite errors rather than silently widening the scan back out.
+        DIFF_BASE: ${{ github.event_name == 'pull_request' && 'auto' || '' }}
+      run: |
+        set +e
+        args=(scan --dir "$DIR")
+        if [[ -n "$DIFF_BASE" ]]; then args+=(--diff-base "$DIFF_BASE"); fi
+        lydite "${args[@]}" 2>&1 | tee "${RUNNER_TEMP}/lydite-scan-output.txt"
+        echo "exit-code=${PIPESTATUS[0]}" >> "$GITHUB_OUTPUT"
+
+    - name: lydite coverage
+      if: inputs.run-coverage == 'true'
+      id: coverage
+      shell: bash
+      env:
+        DIR: ${{ inputs.dir }}
+      run: |
+        set +e
+        # No coverage-production flags here by design. lydite reads
+        # .lydite.yml from "$DIR" itself — who produces coverage
+        # (coverage.source) and where its reports live (coverage.go.report,
+        # coverage.rust.{report,lcov}) all come from there. The action used to
+        # re-encode those as inputs and splice them back into flags, which
+        # meant a repo's coverage wiring was split across two files and the
+        # multi-crate case could only be expressed as newline-separated
+        # "<dir>=<path>" strings.
+        lydite coverage --dir "$DIR" 2>&1 | tee "${RUNNER_TEMP}/lydite-coverage-output.txt"
+        echo "exit-code=${PIPESTATUS[0]}" >> "$GITHUB_OUTPUT"
+
+    - name: Upload coverage to Codecov
+      if: inputs.run-coverage == 'true' && inputs.codecov-token != ''
+      uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7.0.0
+      with:
+        token: ${{ inputs.codecov-token }}
+        report_type: coverage
+        fail_ci_if_error: false
+
+    - name: Upload test results to Codecov
+      if: inputs.run-coverage == 'true' && inputs.codecov-token != ''
+      uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7.0.0
+      with:
+        token: ${{ inputs.codecov-token }}
+        report_type: test_results
+        fail_ci_if_error: false
+
+    - name: Upload lydite output artifact
+      # Capture the full scan/coverage logs as a run artifact so the PR comment
+      # can link to them instead of inlining thousands of lines. A comment that
+      # large is unreadable and also exceeds GitHub's 65536-char limit, which
+      # hard-fails the sticky-comment step. `always()` so the logs are captured
+      # even when a check failed — that's exactly when the full log matters.
+      if: always() && (inputs.run-scan == 'true' || inputs.run-coverage == 'true')
+      id: output-artifact
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+      with:
+        # Job-scoped name so two jobs in the same run don't collide (v4+ errors
+        # on a duplicate artifact name within a run).
+        name: lydite-output-${{ github.job }}
+        path: |
+          ${{ runner.temp }}/lydite-scan-output.txt
+          ${{ runner.temp }}/lydite-coverage-output.txt
+        if-no-files-found: ignore
+        retention-days: 14
+
+    - name: Build PR summary
+      if: github.event_name == 'pull_request' && (inputs.run-scan == 'true' || inputs.run-coverage == 'true')
+      id: summary
+      shell: bash
+      env:
+        RUN_SCAN: ${{ inputs.run-scan }}
+        RUN_COVERAGE: ${{ inputs.run-coverage }}
+        SCAN_EXIT_CODE: ${{ steps.scan.outputs.exit-code }}
+        COVERAGE_EXIT_CODE: ${{ steps.coverage.outputs.exit-code }}
+        ARTIFACT_URL: ${{ steps.output-artifact.outputs.artifact-url }}
+      run: |
+        set +e
+        summary="${RUNNER_TEMP}/lydite-pr-summary.md"
+        scan_out="${RUNNER_TEMP}/lydite-scan-output.txt"
+        coverage_out="${RUNNER_TEMP}/lydite-coverage-output.txt"
+
+        # Best-effort finding counts scraped from each scanner's own summary
+        # output, for a one-line PR comment header — informational only, the
+        # actual pass/fail gate is each command's exit code, not these counts.
+        gosec_count() { grep -oE 'Issues[[:space:]]*:[[:space:]]*[0-9]+' "$1" | grep -oE '[0-9]+' | tail -1; }
+        govulncheck_count() { grep -c '^Vulnerability #' "$1"; }
+        # In CI mode (semgrep ci, diff-aware — used when semgrep-app-token is set), Semgrep
+        # prints two different finding counts: "Current version has N findings." (the whole
+        # repo, unrelated to this PR) and " • Findings: N (M blocking)" (this PR's diff — the
+        # number that actually determines pass/fail). Only the latter is meaningful here; local
+        # `semgrep scan` (no token) has no blocking concept, so falls back to its own
+        # "Ran ... rules on ... files: N findings." total for both fields.
+        semgrep_count() {
+          local line total blocking
+          line=$(grep -oE 'Findings:[[:space:]]*[0-9]+[[:space:]]*\([0-9]+ blocking\)' "$1" | tail -1)
+          if [[ -n "$line" ]]; then
+            read -r total blocking <<< "$(echo "$line" | grep -oE '[0-9]+' | tr '\n' ' ')"
+          else
+            total=$(grep -oE '[0-9]+ findings\.' "$1" | tail -1 | grep -oE '[0-9]+')
+            blocking="$total"
+          fi
+          echo "${total:-0} ${blocking:-0}"
+        }
+        # tool_result reads a tool's own [PASS]/[FAIL] line (lydite scan's own report()
+        # output) — the ground truth for whether that specific tool failed, since a nonzero
+        # SCAN_EXIT_CODE only says "at least one check failed", not which one.
+        # The optional "<dir>: " prefix matches how rust.crateLabel and
+        # golang.moduleLabel qualify a tool name once more than one crate or
+        # module is discovered ("sdk/wardnet-go: gosec"). Without it the
+        # anchored pattern silently matches nothing in exactly the multi-module
+        # repos that need attribution, leaving the comment unable to say which
+        # tool failed. FAIL anywhere wins: "FAIL" sorts before "PASS", so
+        # `sort | head -1` reports FAIL if any crate or module failed; taking
+        # the last line instead would let a passing module mask a failing one.
+        tool_result() { grep -oE "^\[(PASS|FAIL)\] (.*: )?$2\$" "$1" | sed -E 's/^\[([A-Z]+)\].*/\1/' | sort | head -1; }
+
+        # Max bytes of raw tool output to inline per section. GitHub caps a PR
+        # comment at 65536 chars, and the full logs (multi-thousand-line cargo /
+        # compile output) blow past that on their own — so the complete logs go
+        # to the run artifact instead. On failure we still inline the TAIL of the
+        # output, where the tool's error and summary surface, so the actual error
+        # is always visible in the comment without opening the artifact.
+        EXCERPT_CAP=20000
+
+        # Strip ANSI colour codes so the inlined excerpt is readable as plain
+        # text (and a touch smaller); the artifact keeps the raw log.
+        strip_ansi() { sed -E 's/\x1b\[[0-9;]*[A-Za-z]//g'; }
+
+        # Inline a bounded excerpt of a failing tool's output. No-op on success:
+        # a passing multi-thousand-line log helps no one and risks the size cap.
+        emit_error_output() {
+          local file="$1" code="$2" size
+          [[ "$code" == "0" ]] && return 0
+          [[ -f "$file" ]] || return 0
+          size=$(wc -c < "$file" | tr -d ' ')
+          echo
+          echo "<details><summary>error output</summary>"
+          echo
+          echo '```'
+          if (( size > EXCERPT_CAP )); then
+            echo "… truncated to the last ${EXCERPT_CAP} bytes — full log in the run artifact linked below …"
+            tail -c "$EXCERPT_CAP" "$file" | strip_ansi
+          else
+            strip_ansi < "$file"
+          fi
+          echo '```'
+          echo
+          echo "</details>"
+        }
+
+        {
+          # The logo is referenced by absolute raw URL, not a repo-relative path: this comment is
+          # posted into the *consuming* repo's PR, where `assets/...` would resolve against that
+          # repo and 404. Pinned to lydite's default branch rather than a release tag so the
+          # image keeps resolving for consumers still pinned to an older lydite version.
+          echo '## <img src="https://raw.githubusercontent.com/lydite/lydite/main/assets/lydite-mark-64.png" alt="" width="20" align="top"> lydite'
+          echo
+
+          if [[ "$RUN_SCAN" == "true" ]]; then
+            if [[ "$SCAN_EXIT_CODE" == "0" ]]; then
+              echo "- ✅ **scan** — no findings"
+            else
+              parts=()
+              if [[ "$(tool_result "$scan_out" gosec)" == "FAIL" ]]; then
+                n=$(gosec_count "$scan_out"); [[ -n "$n" && "$n" != "0" ]] && parts+=("${n} gosec")
+              fi
+              if [[ "$(tool_result "$scan_out" govulncheck)" == "FAIL" ]]; then
+                n=$(govulncheck_count "$scan_out"); [[ -n "$n" && "$n" != "0" ]] && parts+=("${n} govulncheck")
+              fi
+              if [[ "$(tool_result "$scan_out" semgrep)" == "FAIL" ]]; then
+                read -r n _ <<< "$(semgrep_count "$scan_out")"
+                [[ -n "$n" && "$n" != "0" ]] && parts+=("${n} semgrep")
+              fi
+              if [[ "${#parts[@]}" -gt 0 ]]; then
+                detail=$(IFS=,; echo "${parts[*]}" | sed 's/,/, /g')
+                echo "- ❌ **scan** — ${detail} findings"
+              else
+                echo "- ❌ **scan** — failed, see error output below"
+              fi
+              # The error itself is always surfaced inline on failure, per the
+              # reporting contract — not just linked away in the artifact.
+              emit_error_output "$scan_out" "$SCAN_EXIT_CODE"
+            fi
+            echo
+          fi
+
+          if [[ "$RUN_COVERAGE" == "true" ]]; then
+            cov_icon="✅"
+            [[ "$COVERAGE_EXIT_CODE" != "0" ]] && cov_icon="❌"
+            # Not line-anchored: lydite's own output has run the cached-baseline
+            # JSON blob and the "[PASS] go: ..." summary together with no
+            # newline between them (e.g. "}[PASS]    go: 56.9% (baseline 56.9%)"),
+            # so a `^`-anchored match silently finds nothing on a real run.
+            # The tag itself is deliberately generic ([A-Z]+, not an enumerated
+            # PASS|FAIL|... list): lydite's gate output is the only bracketed
+            # text on coverage stdout, and enumerating tags silently dropped
+            # [UNMEASURED] lines from the comment when that tag was added.
+            cov_detail=$(grep -oE '\[[A-Z]+\][[:space:]]+.*' "$coverage_out" | sed -E 's/^\[[A-Z]+\][[:space:]]+//' | paste -sd ';' - | sed 's/;/; /g')
+            [[ -z "$cov_detail" ]] && cov_detail="see error output below"
+            echo "- ${cov_icon} **coverage** — ${cov_detail}"
+            emit_error_output "$coverage_out" "$COVERAGE_EXIT_CODE"
+            echo
+          fi
+
+          if [[ -n "${ARTIFACT_URL}" ]]; then
+            echo "📦 [Full lydite output](${ARTIFACT_URL}) — complete scan and coverage logs."
+          fi
+        } > "${summary}"
+
+        # Final safety net: never exceed GitHub's 65536-char comment limit, even
+        # if two bounded excerpts plus headers somehow approach it. Truncating
+        # here still leaves the full logs available in the artifact.
+        limit=65000
+        if (( $(wc -c < "$summary" | tr -d ' ') > limit )); then
+          head -c "$limit" "$summary" > "${summary}.tmp"
+          printf '\n\n… comment truncated to fit GitHub'"'"'s 65536-char limit — see the run artifact for full output …\n' >> "${summary}.tmp"
+          mv "${summary}.tmp" "$summary"
+        fi
+        echo "summary-path=${summary}" >> "$GITHUB_OUTPUT"
+
+    - name: Post PR summary
+      if: github.event_name == 'pull_request' && (inputs.run-scan == 'true' || inputs.run-coverage == 'true')
+      uses: marocchino/sticky-pull-request-comment@5770ad5eb8f42dd2c4f34da00c94c5381e49af88 # v3.0.5
+      with:
+        GITHUB_TOKEN: ${{ inputs.github-token }}
+        header: lydite
+        path: ${{ steps.summary.outputs.summary-path }}
+
+    - name: Fail if any check failed
+      if: (inputs.run-scan == 'true' && steps.scan.outputs.exit-code != '0') || (inputs.run-coverage == 'true' && steps.coverage.outputs.exit-code != '0')
+      shell: bash
+      run: |
+        echo "lydite scan or coverage failed — see the steps above for details." >&2
+        exit 1

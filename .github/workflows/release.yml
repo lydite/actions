@@ -1,0 +1,54 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write
+
+jobs:
+  move-major-tag:
+    name: move major tag
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      # Consumers pin lydite/actions/scan@v1, not a patch tag — the floating
+      # major is the delivery channel, moved deliberately on each release.
+      #
+      # Forgetting is silent and total: every consumer keeps running the old
+      # action, no drift signal fires, and the release looks published because
+      # the tag is there. So it verifies the move rather than assuming the
+      # push worked.
+      #
+      # This machinery lives here and not in lydite/lydite: install.sh and
+      # `lydite update` both resolve through the releases/latest redirect or an
+      # exact v<version> tag, so the CLI repo's major alias had no consumer once
+      # the action moved out of it.
+      - name: Move the major version tag
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+
+          major="${TAG%%.*}"   # v1.8.0 -> v1
+          if [[ ! "$major" =~ ^v[0-9]+$ ]]; then
+            echo "::error::could not derive a major tag from ${TAG}"
+            exit 1
+          fi
+
+          echo "Moving ${major} -> ${TAG} ($(git rev-parse --short "$TAG"))"
+          git tag -f "$major" "$TAG"
+          git push --force origin "refs/tags/${major}"
+
+          remote_sha=$(git ls-remote origin "refs/tags/${major}" | cut -f1)
+          expected_sha=$(git rev-parse "${major}")
+          if [[ "$remote_sha" != "$expected_sha" ]]; then
+            echo "::error::${major} did not advance on the remote (got ${remote_sha}, want ${expected_sha})"
+            exit 1
+          fi
+          echo "${major} now points at ${TAG}." >> "$GITHUB_STEP_SUMMARY"
