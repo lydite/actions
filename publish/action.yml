@@ -1,0 +1,166 @@
+# Renders lydite's standing pull-request comment and posts it.
+#
+# It assumes lydite is already on PATH — `lydite/actions/setup` puts it there.
+#
+# This is the only action that authenticates, and the split is the point.
+# `lydite publish` renders and posts nothing: it takes report directories and
+# writes a file, with no network, no token and no knowledge of a hosting
+# platform. Posting takes a file and a marker and knows nothing about coverage,
+# components or verdicts. So refining what the comment says never needs a
+# release of this action, and a developer can run `lydite publish` locally and
+# read exactly what a reviewer will see.
+#
+# Two identities, and the second is required rather than a stopgap:
+#
+#   - The relay. The job presents the Actions OIDC token GitHub minted for this
+#     run, which grants nothing by itself; the relay decides which repository
+#     and which pull request may be written to from the claims GitHub signed,
+#     mints a token narrowed to that, posts, and discards it. The comment
+#     arrives as lydite, and the job holds no credential that could write
+#     anywhere. That needs `id-token: write`.
+#   - The workflow's own token. No relay configured, or a relay answering that
+#     the app is not installed, posts as `github-actions[bot]`. A consumer who
+#     installed nothing still gets the surface, and the only thing they lose is
+#     whose name is on it. That needs `pull-requests: write`.
+#
+# The marker is read back from the comment's own first line and never restated
+# here. It is `ui.Marker`, and a second copy in a workflow is a copy that can
+# disagree — a run would then post a fresh comment every time instead of
+# editing the standing one, and the relay and the fallback would orphan each
+# other's comments rather than handing over.
+#
+# Nothing interpolates an expression into a `run:` body. A comment body is the
+# most attacker-shaped value here: it quotes a pull request's own source.
+name: lydite publish
+description: Render lydite's standing pull-request comment from a run's reports, and post it
+
+inputs:
+  reports:
+    description: >
+      directory holding one subdirectory per job's uploaded reports, as
+      `actions/download-artifact` with a pattern produces
+    required: false
+    default: reports
+  pull-request:
+    description: the pull request to comment on
+    required: true
+  base:
+    description: the base commit the comment reports against
+    required: false
+    default: ""
+  relay:
+    description: the relay's origin; empty falls straight back to the workflow's token
+    required: false
+    default: ""
+  token:
+    description: the token the fallback path posts with
+    required: false
+    default: ${{ github.token }}
+
+runs:
+  using: composite
+  steps:
+    # Every job's directory, each under its own name. `publish` takes as many
+    # as it is given and names any it could not read, so a job that died before
+    # uploading renders as a section saying so rather than vanishing — a
+    # section that quietly disappears is indistinguishable from a concern that
+    # passed.
+    - id: render
+      shell: bash
+      env:
+        REPORTS: ${{ inputs.reports }}
+        BASE_SHA: ${{ inputs.base }}
+      run: |
+        set -euo pipefail
+        shopt -s nullglob
+        args=()
+        for dir in "${REPORTS%/}"/*/; do
+          args+=(--reports "${dir%/}")
+        done
+        if [ "${#args[@]}" -eq 0 ]; then
+          echo "::error::no report directories under ${REPORTS}; there is nothing to publish"
+          exit 1
+        fi
+        if [ -n "${BASE_SHA}" ]; then
+          args+=(--base "${BASE_SHA}")
+        fi
+        lydite publish "${args[@]}" --out "${RUNNER_TEMP}/lydite-comment.md"
+        echo "body-file=${RUNNER_TEMP}/lydite-comment.md" >> "${GITHUB_OUTPUT}"
+        echo "::group::the comment"
+        cat "${RUNNER_TEMP}/lydite-comment.md"
+        echo "::endgroup::"
+
+    - id: relay
+      if: inputs.relay != ''
+      shell: bash
+      env:
+        BODY_FILE: ${{ steps.render.outputs.body-file }}
+        NUMBER: ${{ inputs.pull-request }}
+        RELAY: ${{ inputs.relay }}
+      run: |
+        set -euo pipefail
+
+        marker=$(head -n 1 "${BODY_FILE}")
+        case "${marker}" in
+          '<!-- lydite:'*'-->') ;;
+          *) echo "::error::the rendered comment does not begin with lydite's marker"; exit 1 ;;
+        esac
+
+        # The audience is the relay's own origin, so a token minted here cannot
+        # be replayed against another service — and the relay refuses one whose
+        # audience is not its own.
+        token=$(curl -fsS \
+          -H "Authorization: Bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+          "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=${RELAY}" | jq -r '.value')
+
+        jq -n --arg marker "${marker}" --arg body "$(cat "${BODY_FILE}")" --argjson pr "${NUMBER}" \
+          '{marker: $marker, body: $body, pull_request: $pr}' > "${RUNNER_TEMP}/relay.json"
+
+        # The repository is deliberately not sent. The relay takes it from the
+        # verified claim, so there is nothing here that could name another one.
+        status=$(curl -sS -o "${RUNNER_TEMP}/relay-out.json" -w '%{http_code}' \
+          -X POST "${RELAY}/comment" \
+          -H "Authorization: Bearer ${token}" \
+          -H 'content-type: application/json' \
+          --data-binary "@${RUNNER_TEMP}/relay.json") || status=000
+
+        if [ "${status}" = "200" ]; then
+          echo "posted=true" >> "${GITHUB_OUTPUT}"
+          exit 0
+        fi
+        echo "posted=false" >> "${GITHUB_OUTPUT}"
+        echo "the relay answered ${status}; falling back to this workflow's token" >&2
+        cat "${RUNNER_TEMP}/relay-out.json" >&2 || true
+
+    - if: steps.relay.outputs.posted != 'true'
+      shell: bash
+      env:
+        BODY_FILE: ${{ steps.render.outputs.body-file }}
+        NUMBER: ${{ inputs.pull-request }}
+        REPO: ${{ github.repository }}
+        GH_TOKEN: ${{ inputs.token }}
+      run: |
+        set -euo pipefail
+
+        marker=$(head -n 1 "${BODY_FILE}")
+        case "${marker}" in
+          '<!-- lydite:'*'-->') ;;
+          *) echo "::error::the rendered comment does not begin with lydite's marker"; exit 1 ;;
+        esac
+
+        # Found by the marker and not by author, which is what lets the relay
+        # later take over a comment this path posted rather than orphaning it
+        # and leaving two standing verdicts on the pull request.
+        existing=$(gh api --paginate \
+          "repos/${REPO}/issues/${NUMBER}/comments" \
+          --jq "map(select(.body | contains(\"${marker}\"))) | .[0].id // empty")
+
+        if [ -n "${existing}" ]; then
+          gh api -X PATCH "repos/${REPO}/issues/comments/${existing}" \
+            -F "body=@${BODY_FILE}" --silent
+          echo "edited comment ${existing}"
+        else
+          gh api -X POST "repos/${REPO}/issues/${NUMBER}/comments" \
+            -F "body=@${BODY_FILE}" --silent
+          echo "created a comment"
+        fi
