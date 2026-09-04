@@ -1,0 +1,88 @@
+# Puts a released lydite on PATH.
+#
+# It downloads the binary and the release's checksums.txt and verifies one
+# against the other before anything is executed. It deliberately does NOT pipe
+# the release's install.sh into a shell: install.sh is published as a release
+# asset but is not itself listed in checksums.txt, so running it would execute
+# an unverified script in order to perform a verified download. A tool whose
+# whole premise is pinning what it runs cannot begin by not doing that.
+#
+# The duplication with install.sh is accepted and small. That script exists for
+# a person at a terminal, where $HOME/.local/bin and a `latest` default are the
+# right answers; this exists for a runner, where the version is pinned and the
+# install directory is the runner's temp.
+name: Set up lydite
+description: Download a released lydite, verify its checksum, and put it on PATH
+
+inputs:
+  version:
+    description: the release to install, e.g. 0.1.0 or v0.1.0; `latest` resolves the newest
+    required: false
+    default: latest
+
+outputs:
+  version:
+    description: the version actually installed, without a leading v
+    value: ${{ steps.install.outputs.version }}
+
+runs:
+  using: composite
+  steps:
+    - id: install
+      shell: bash
+      env:
+        REQUESTED: ${{ inputs.version }}
+      run: |
+        set -euo pipefail
+        repo=https://github.com/lydite/lydite
+
+        version="${REQUESTED}"
+        if [ "${version}" = "latest" ]; then
+          # releases/latest redirects to .../releases/tag/v<version>.
+          location=$(curl -fsSI -o /dev/null -w '%{redirect_url}' "${repo}/releases/latest")
+          version="${location##*/}"
+        fi
+        version="${version#v}"
+        if [ -z "${version}" ]; then
+          echo "::error::could not resolve a lydite version from '${REQUESTED}'"
+          exit 1
+        fi
+
+        os=$(uname -s | tr '[:upper:]' '[:lower:]')
+        case "$(uname -m)" in
+          x86_64|amd64) arch=amd64 ;;
+          aarch64|arm64) arch=arm64 ;;
+          *) echo "::error::unsupported architecture $(uname -m)"; exit 1 ;;
+        esac
+        asset="lydite_${version}_${os}_${arch}"
+
+        dir="${RUNNER_TEMP}/lydite-bin"
+        mkdir -p "${dir}"
+
+        # curl's own 404 is a bare exit code, and under  the step ends
+        # there with nothing said about which asset was missing — which for a
+        # version that does not exist is the whole of what the reader needs.
+        fetch() {
+          if ! curl -fsSL -o "$2" "$1"; then
+            echo "::error::could not download $1 — is v${version} a released lydite version?"
+            exit 1
+          fi
+        }
+        fetch "${repo}/releases/download/v${version}/${asset}" "${dir}/lydite"
+        fetch "${repo}/releases/download/v${version}/checksums.txt" "${RUNNER_TEMP}/checksums.txt"
+
+        want=$(awk -v a="${asset}" '$2 == a { print $1 }' "${RUNNER_TEMP}/checksums.txt")
+        if [ -z "${want}" ]; then
+          echo "::error::no checksum for ${asset} in this release's checksums.txt"
+          exit 1
+        fi
+        got=$(sha256sum "${dir}/lydite" | awk '{ print $1 }')
+        if [ "${got}" != "${want}" ]; then
+          echo "::error::checksum mismatch for ${asset}: got ${got}, want ${want}"
+          exit 1
+        fi
+
+        chmod +x "${dir}/lydite"
+        echo "${dir}" >> "${GITHUB_PATH}"
+        echo "version=${version}" >> "${GITHUB_OUTPUT}"
+        echo "installed lydite v${version} (${os}/${arch})"

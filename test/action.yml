@@ -1,0 +1,122 @@
+# Runs every declared component's suite, and gates its coverage.
+#
+# It assumes lydite is already on PATH — `lydite/actions/setup` puts it there.
+#
+# Three of the inputs decide what this actually enforces, and two of them are
+# deliberately not inferred:
+#
+#   - `gate-coverage` turns on the baseline read, the comparison and the
+#     record. Without it the run measures and reports and gates nothing, and
+#     says so — a coverage row renders as context rather than as a pass, so a
+#     workflow that forgot the flag cannot read as a gated one.
+#   - `affected` runs only the components a change could have broken. It
+#     belongs on a pull request and never on a push to the default branch,
+#     where lydite runs everything regardless so that a missed `depends_on`
+#     edge is caught at merge.
+#
+# lydite refuses to infer either. Every signal for "is this a pull request" is
+# unreliable where it runs — a detached HEAD, a shallow clone, a fork with no
+# upstream — and the workflow already knows the event.
+#
+# The gate resolves a merge-base, so the caller's checkout has to be
+# `fetch-depth: 0`.
+name: lydite test
+description: Run each component's suite under lydite, gate coverage, and upload the reports
+
+inputs:
+  dir:
+    description: the scan root, relative to the workspace
+    required: false
+    default: "."
+  gate-coverage:
+    description: compare each component's coverage against its baseline, and record it
+    required: false
+    default: "false"
+  affected:
+    description: run only the components this change could have broken
+    required: false
+    default: "false"
+  base-branch:
+    description: >
+      the branch a merge-base is resolved against. Pass `github.base_ref` on a
+      pull request; empty lets lydite discover the default branch.
+    required: false
+    default: ""
+  concurrency:
+    description: how many components may run at once; empty keeps lydite's own default
+    required: false
+    default: ""
+  cache:
+    description: >
+      cache ~/.cache/lydite, where every pinned runner, scanner and language
+      toolchain lydite installs lands
+    required: false
+    default: "true"
+  upload-reports:
+    description: upload .lydite-reports as an artifact for a later `publish`
+    required: false
+    default: "true"
+  artifact-name:
+    description: which job's reports these are; becomes the artifact suffix
+    required: false
+    default: test
+
+runs:
+  using: composite
+  steps:
+    # Keyed on the pin manifests, so a Dependabot bump misses and installs what
+    # it just pinned. The globs are lydite's own layout for a consumer that
+    # vendors nothing, plus whatever the repository's own declaration names.
+    - if: ${{ inputs.cache == 'true' }}
+      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ~/.cache/lydite
+        key: lydite-${{ runner.os }}-${{ hashFiles('**/.lydite/components.yml', '**/rust-toolchain.toml', '**/package-lock.json', '**/go.sum') }}
+        restore-keys: lydite-${{ runner.os }}-
+
+    # Every value reaches the script through env. Interpolating `${{ }}` into a
+    # run body is a script-injection vector.
+    - shell: bash
+      env:
+        DIR: ${{ inputs.dir }}
+        GATE: ${{ inputs.gate-coverage }}
+        AFFECTED: ${{ inputs.affected }}
+        BASE_BRANCH: ${{ inputs.base-branch }}
+        CONCURRENCY: ${{ inputs.concurrency }}
+      run: |
+        set -euo pipefail
+        args=(test --dir "${DIR}")
+        if [ "${GATE}" = "true" ]; then
+          args+=(--gate-coverage)
+        fi
+        if [ "${AFFECTED}" = "true" ]; then
+          args+=(--affected)
+        fi
+        if [ -n "${BASE_BRANCH}" ]; then
+          args+=(--base-branch "${BASE_BRANCH}")
+        fi
+        if [ -n "${CONCURRENCY}" ]; then
+          args+=(--concurrency "${CONCURRENCY}")
+        fi
+        lydite "${args[@]}"
+
+    - id: reports
+      if: ${{ always() && inputs.upload-reports == 'true' }}
+      shell: bash
+      env:
+        DIR: ${{ inputs.dir }}
+      run: |
+        path="${DIR%/}/.lydite-reports"
+        if [ -d "${path}" ]; then
+          echo "path=${path}" >> "${GITHUB_OUTPUT}"
+        else
+          echo "no ${path}: this job wrote no report" >&2
+        fi
+
+    - if: ${{ always() && steps.reports.outputs.path != '' }}
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      with:
+        name: lydite-reports-${{ inputs.artifact-name }}
+        path: ${{ steps.reports.outputs.path }}
+        retention-days: 7
+        include-hidden-files: true

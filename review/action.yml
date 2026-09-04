@@ -1,0 +1,101 @@
+# Decides whether a change may merge unattended, and records that as a commit
+# status.
+#
+# It assumes lydite is already on PATH — `lydite/actions/setup` puts it there.
+#
+# `review` runs no check. It emits pass or refer, and a referral names no
+# defect: it says a person has to look. The status it publishes is the whole
+# record a `/lydite clear` comment acts on, so this belongs in a job with no
+# `needs` — a reader can start clearing a referral while the suites are still
+# running.
+#
+# The exit code is an answer, not a malfunction: 2 is a referral and 1 is the
+# exemption-isolation gate, and the verdict is carried by the status and by the
+# report this wrote. Anything above 2 is lydite failing to reach an answer at
+# all, which does fail the job.
+#
+# It is captured with `|| verdict=$?` rather than read from `$?` on the next
+# line, because the runner invokes this with `bash -e`: a bare command exiting
+# non-zero ends the step before any following line runs, and `set +e` would
+# also disarm the failure this step does want to report.
+#
+# The verdict is computed from <merge-base>..HEAD, so the caller's checkout has
+# to be `fetch-depth: 0`.
+name: lydite review
+description: Publish the referral verdict for a change, and upload the report
+
+inputs:
+  dir:
+    description: >
+      where .lydite/exemptions.yml is read from. The diff a referral reads
+      covers the whole repository regardless — a workflow edit outside a
+      monorepo's scan root is exactly what must not slip past.
+    required: false
+    default: "."
+  publish:
+    description: write the verdict as the `lydite/referral` commit status
+    required: false
+    default: "true"
+  base-branch:
+    description: >
+      the branch a merge-base is resolved against. Pass `github.base_ref` on a
+      pull request; empty lets lydite discover the default branch.
+    required: false
+    default: ""
+  token:
+    description: the token the commit status is written with
+    required: false
+    default: ${{ github.token }}
+  upload-reports:
+    description: upload .lydite-reports as an artifact for a later `publish`
+    required: false
+    default: "true"
+  artifact-name:
+    description: which job's reports these are; becomes the artifact suffix
+    required: false
+    default: referral
+
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      env:
+        DIR: ${{ inputs.dir }}
+        PUBLISH: ${{ inputs.publish }}
+        BASE_BRANCH: ${{ inputs.base-branch }}
+        GITHUB_TOKEN: ${{ inputs.token }}
+      run: |
+        set -euo pipefail
+        args=(review --dir "${DIR}")
+        if [ "${PUBLISH}" = "true" ]; then
+          args+=(--publish)
+        fi
+        if [ -n "${BASE_BRANCH}" ]; then
+          args+=(--base-branch "${BASE_BRANCH}")
+        fi
+        verdict=0
+        lydite "${args[@]}" || verdict=$?
+        if [ "${verdict}" -gt 2 ]; then
+          exit "${verdict}"
+        fi
+
+    - id: reports
+      if: ${{ always() && inputs.upload-reports == 'true' }}
+      shell: bash
+      env:
+        DIR: ${{ inputs.dir }}
+      run: |
+        path="${DIR%/}/.lydite-reports"
+        if [ -d "${path}" ]; then
+          echo "path=${path}" >> "${GITHUB_OUTPUT}"
+        else
+          echo "no ${path}: this job wrote no report" >&2
+        fi
+
+    - if: ${{ always() && steps.reports.outputs.path != '' }}
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      with:
+        name: lydite-reports-${{ inputs.artifact-name }}
+        path: ${{ steps.reports.outputs.path }}
+        retention-days: 7
+        include-hidden-files: true
