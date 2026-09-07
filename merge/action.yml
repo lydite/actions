@@ -1,0 +1,105 @@
+# Folds a shard matrix's documents back into one, and uploads the result as the
+# `test` section of the comment.
+#
+# It assumes lydite is already on PATH — `lydite/actions/setup` puts it there.
+#
+# This is where completeness is decided, and it is the reason the shards may
+# each report only what they own. Every declared component takes exactly one row
+# across the matrix, so a component with no row is a shard whose job died and a
+# component with two is two jobs running the same work — both failures, and
+# neither is `unmeasured`, which does not vote and would publish a passing
+# verdict over a repository half of which was never tested.
+#
+# It is also the only thing that computes `coverage(repo)` and `patch(repo)`.
+# Both sum every component's counts, so a shard holding two of four would answer
+# about its own two under a label about the repository. The shards' measurements
+# carry each component's counts, its patch part and the baseline entry it was
+# gated against, so the composition touches no network, resolves no merge-base
+# and runs nothing from the repository.
+#
+# It needs a checkout, because completeness is a question about the declaration
+# and the declaration is read from the tree.
+name: lydite test merge
+description: Fold every shard's lydite test report into one, and upload it for a later publish
+
+inputs:
+  dir:
+    description: the scan root, relative to the workspace
+    required: false
+    default: "."
+  reports:
+    description: >
+      directory holding one subdirectory per shard's uploaded reports, as
+      `actions/download-artifact` with a `lydite-shard-*` pattern produces
+    required: false
+    default: shards
+  upload-reports:
+    description: upload the folded .lydite-reports as an artifact for a later `publish`
+    required: false
+    default: "true"
+  artifact-name:
+    description: which section of the comment these reports become
+    required: false
+    default: test
+
+runs:
+  using: composite
+  steps:
+    # Every value reaches the script through env. Interpolating `${{ }}` into a
+    # run body is a script-injection vector.
+    - shell: bash
+      env:
+        DIR: ${{ inputs.dir }}
+        REPORTS: ${{ inputs.reports }}
+      run: |
+        set -euo pipefail
+        shopt -s nullglob
+
+        args=()
+        for dir in "${REPORTS%/}"/*/; do
+          args+=(--reports "${dir%/}")
+        done
+        if [ "${#args[@]}" -eq 0 ]; then
+          echo "::error::no shard uploaded a report directory under ${REPORTS}; there is nothing to fold"
+          exit 1
+        fi
+
+        # Each shard's component subdirectories are copied in first. The folded
+        # rows carry the shards' own `log` paths, and `publish` resolves those
+        # against the directory it is given — this one. Without the copy a red
+        # component's row in the comment names a log that is in an artifact
+        # `publish` deliberately never downloads, and carries no tail at all.
+        out="${DIR%/}/.lydite-reports"
+        mkdir -p "${out}"
+        for logs in "${REPORTS%/}"/*/*/; do
+          cp -R "${logs}" "${out}/"
+        done
+
+        # The verdict over the whole repository is this step's, so the exit code
+        # is re-raised rather than only reported. The upload below runs on
+        # `always()`, so a failing fold still reaches the comment.
+        status=0
+        lydite test merge --dir "${DIR}" "${args[@]}" || status=$?
+        echo "lydite test merge exited ${status}"
+        exit "${status}"
+
+    - id: reports
+      if: ${{ always() && inputs.upload-reports == 'true' }}
+      shell: bash
+      env:
+        DIR: ${{ inputs.dir }}
+      run: |
+        path="${DIR%/}/.lydite-reports"
+        if [ -d "${path}" ]; then
+          echo "path=${path}" >> "${GITHUB_OUTPUT}"
+        else
+          echo "no ${path}: this job wrote no report" >&2
+        fi
+
+    - if: ${{ always() && steps.reports.outputs.path != '' }}
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      with:
+        name: lydite-reports-${{ inputs.artifact-name }}
+        path: ${{ steps.reports.outputs.path }}
+        retention-days: 7
+        include-hidden-files: true

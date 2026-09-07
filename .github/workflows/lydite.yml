@@ -3,6 +3,10 @@
 # A consumer calls this and gets the referral, the scan, the gated suites and
 # one standing comment assembled from all three:
 #
+#   referral ──────────────────┐   no needs, so the status lands in seconds
+#   scan ──────────────────────┤
+#   plan ────► test (matrix) ──► merge ──► publish   needs all, if: always()
+#
 #   jobs:
 #     lydite:
 #       uses: lydite/actions/.github/workflows/lydite.yml@v1
@@ -20,6 +24,22 @@
 #
 # The referral has no `needs`, so its status lands within seconds of a push and
 # a reader can start clearing it while the suites are still running (ADR 0015).
+#
+# The suites are sharded. `plan` groups the declared components into the sets
+# that must run in one process — those publishing a host port in common, or
+# rooted at overlapping directories — and each matrix job runs one of them. A
+# shard reports exactly the components it was given and nothing about any
+# other, so every declared component takes exactly one row across the matrix,
+# and `merge` fails over a component with no row (a shard whose job died) or
+# two (two jobs running the same work). The fold is also the only thing that
+# can compute `coverage(repo)` and `patch(repo)`, since both sum every
+# component's counts.
+#
+# Nothing records a coverage baseline here, and that is the design rather than
+# an omission. Recording is a push to the `lydite` branch, and this workflow's
+# jobs run a pull request's own suites and whatever `setup`/`teardown` shell its
+# declaration carries. `lydite-baseline.yml` in this repository is the shape
+# that records, after a change has merged.
 #
 # The actions are referenced at @v1 rather than by a relative path, because a
 # relative `uses:` in a called workflow resolves against the caller's checkout,
@@ -126,16 +146,48 @@ jobs:
           base-branch: ${{ github.event_name == 'pull_request' && github.base_ref || '' }}
           semgrep-token: ${{ secrets.semgrep-token }}
 
+  # Pure: it reads `.lydite/components.yml` and each component's compose file,
+  # and nothing else — no git, no network, no process. So it needs no history
+  # and no container runtime, and it cannot narrow by `affected`, which needs a
+  # merge-base. The shards narrow instead.
+  plan:
+    name: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      shards: ${{ steps.plan.outputs.shards }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: lydite/actions/setup@v1
+        with:
+          version: ${{ inputs.lydite-version }}
+
+      - uses: lydite/actions/plan@v1
+        id: plan
+        with:
+          dir: ${{ inputs.dir }}
+
   test:
-    name: test
+    name: test (${{ matrix.shard.name }})
+    needs: plan
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    strategy:
+      # Every failing shard, in one run. A cancelled sibling leaves its
+      # components with no row at all, which `merge` reports as a shard that
+      # died rather than as the failure that actually happened.
+      fail-fast: false
+      matrix:
+        shard: ${{ fromJSON(needs.plan.outputs.shards) }}
     # Read-only, deliberately. This job runs the repository's own suites and
     # any setup/teardown shell the declaration carries, which on a pull request
-    # is the pull request's own code. With no token that can write, the
-    # baseline is not recorded, the `record` row says so, and every run
-    # measures the base tree instead of reading one. That costs an instrumented
-    # run per change and is the supported configuration.
+    # is the pull request's own code. Nothing it runs holds a token that can
+    # write anywhere, and nothing it runs would use one: `lydite test` writes
+    # nothing to the `lydite` branch, leaving its measurement as a candidate for
+    # `lydite/actions/record` to land from a job that runs no repository code.
     permissions:
       contents: read
     steps:
@@ -154,11 +206,45 @@ jobs:
           # Never on a push to the default branch, where lydite runs every
           # component so that a missed `depends_on` edge is caught at merge.
           affected: ${{ inputs.affected && github.event_name == 'pull_request' }}
+          component: ${{ matrix.shard.components }}
           base-branch: ${{ github.event_name == 'pull_request' && github.base_ref || '' }}
+          # Under its own prefix, so `publish` never reads a shard's document as
+          # a `test` section of its own: there would be one per shard, each
+          # answering about part of the repository under one heading.
+          artifact-name: ${{ matrix.shard.name }}
+          artifact-prefix: lydite-shard
+
+  merge:
+    name: merge
+    needs: [plan, test]
+    # Whatever the shards did. A shard that failed is exactly the run whose fold
+    # a reader wants, and a shard that died is what the fold exists to report
+    # rather than to inherit as silence.
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: lydite/actions/setup@v1
+        with:
+          version: ${{ inputs.lydite-version }}
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: lydite-shard-*
+          path: shards
+
+      - uses: lydite/actions/merge@v1
+        with:
+          dir: ${{ inputs.dir }}
+          reports: shards
 
   publish:
     name: publish
-    needs: [referral, scan, test]
+    needs: [referral, scan, merge]
     # Runs whatever the others did. A comment that only appears when everything
     # passed is a comment nobody needs: the run that failed is the one whose
     # reader wants to know why.

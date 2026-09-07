@@ -1,22 +1,40 @@
-# Runs every declared component's suite, and gates its coverage.
+# Runs the suites this job is responsible for, and gates their coverage.
 #
 # It assumes lydite is already on PATH — `lydite/actions/setup` puts it there.
 #
-# Three of the inputs decide what this actually enforces, and two of them are
-# deliberately not inferred:
+# Three inputs decide what this actually enforces, and none of the three is
+# inferred:
 #
-#   - `gate-coverage` turns on the baseline read, the comparison and the
-#     record. Without it the run measures and reports and gates nothing, and
-#     says so — a coverage row renders as context rather than as a pass, so a
-#     workflow that forgot the flag cannot read as a gated one.
+#   - `gate-coverage` turns on the baseline read and the comparison. Without it
+#     the run measures and reports and gates nothing, and says so — a coverage
+#     row renders as context rather than as a pass, so a workflow that forgot
+#     the flag cannot read as a gated one. It writes nothing to the `lydite`
+#     branch either way: it leaves what it measured in the report directory as
+#     a candidate, and `lydite/actions/record` is the only thing that lands
+#     one. A workflow that gates and never records is correct, pays a base-tree
+#     measurement on every change, and says so in its `record` row.
 #   - `affected` runs only the components a change could have broken. It
 #     belongs on a pull request and never on a push to the default branch,
 #     where lydite runs everything regardless so that a missed `depends_on`
 #     edge is caught at merge.
+#   - `component` says which components this job is *responsible for*, which is
+#     what lets a matrix of jobs each hold one shard.
 #
-# lydite refuses to infer either. Every signal for "is this a pull request" is
+# lydite infers none of them. Every signal for "is this a pull request" is
 # unreliable where it runs — a detached HEAD, a shallow clone, a fork with no
-# upstream — and the workflow already knows the event.
+# upstream — and the workflow already knows the event; and no run can guess
+# which slice of a matrix it is.
+#
+# `component` and `affected` compose rather than substituting for each other:
+# `component` narrows what this job answers about, `affected` narrows which of
+# those actually run, and a component in the slice that selection skipped is
+# still reported — one row, carrying its baseline entry forward. A job reports
+# nothing at all about a component outside its slice, which is what lets
+# `lydite/actions/merge` decide completeness from the declaration and the
+# documents alone. A run narrowed by `component` therefore emits no
+# `coverage(repo)` and no `patch(repo)` row: both sum every component's counts,
+# and a shard holding two of four would answer about its own two under a label
+# about the repository. The fold emits them.
 #
 # The gate resolves a merge-base, so the caller's checkout has to be
 # `fetch-depth: 0`.
@@ -29,13 +47,19 @@ inputs:
     required: false
     default: "."
   gate-coverage:
-    description: compare each component's coverage against its baseline, and record it
+    description: compare each component's coverage against its baseline
     required: false
     default: "false"
   affected:
     description: run only the components this change could have broken
     required: false
     default: "false"
+  component:
+    description: >
+      comma-separated components this job is responsible for; empty makes it
+      responsible for every declared one. A shard matrix passes its own slice.
+    required: false
+    default: ""
   base-branch:
     description: >
       the branch a merge-base is resolved against. Pass `github.base_ref` on a
@@ -60,6 +84,15 @@ inputs:
     description: which job's reports these are; becomes the artifact suffix
     required: false
     default: test
+  artifact-prefix:
+    description: >
+      what the artifact is called before the suffix. A shard's document is an
+      input to `lydite/actions/merge`, not a section of the comment, so a matrix
+      passes `lydite-shard`: `publish` reads `lydite-reports-*`, and would
+      otherwise render one `test` section per shard, each answering about part
+      of the repository under one heading.
+    required: false
+    default: lydite-reports
 
 runs:
   using: composite
@@ -81,6 +114,7 @@ runs:
         DIR: ${{ inputs.dir }}
         GATE: ${{ inputs.gate-coverage }}
         AFFECTED: ${{ inputs.affected }}
+        COMPONENT: ${{ inputs.component }}
         BASE_BRANCH: ${{ inputs.base-branch }}
         CONCURRENCY: ${{ inputs.concurrency }}
       run: |
@@ -91,6 +125,9 @@ runs:
         fi
         if [ "${AFFECTED}" = "true" ]; then
           args+=(--affected)
+        fi
+        if [ -n "${COMPONENT}" ]; then
+          args+=(--component "${COMPONENT}")
         fi
         if [ -n "${BASE_BRANCH}" ]; then
           args+=(--base-branch "${BASE_BRANCH}")
@@ -116,7 +153,7 @@ runs:
     - if: ${{ always() && steps.reports.outputs.path != '' }}
       uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
       with:
-        name: lydite-reports-${{ inputs.artifact-name }}
+        name: ${{ inputs.artifact-prefix }}-${{ inputs.artifact-name }}
         path: ${{ steps.reports.outputs.path }}
         retention-days: 7
         include-hidden-files: true

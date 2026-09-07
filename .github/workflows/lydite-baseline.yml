@@ -1,0 +1,164 @@
+# Records a repository's per-component coverage baseline, after a change has
+# merged.
+#
+# A consumer calls this from a push to their default branch:
+#
+#   name: lydite-baseline
+#   on:
+#     push:
+#       branches: [main]
+#
+#   jobs:
+#     baseline:
+#       uses: lydite/actions/.github/workflows/lydite-baseline.yml@v1
+#       permissions:
+#         contents: write   # the recording job pushes to the `lydite` branch
+#
+# It is a separate workflow from `lydite.yml`, and the separation is the whole
+# point. Recording is a push to the `lydite` branch, and measuring runs the
+# repository's own suites and whatever `setup`/`teardown` shell its declaration
+# carries. Those two must not be the same job on a pull request: a branch can
+# edit its own workflow and its own component declaration, so a job that runs a
+# branch's code with a writable token is arbitrary write access for anyone who
+# can open a pull request.
+#
+# `lydite test` writes nothing to the `lydite` branch at all, so measuring and
+# recording are two commands in two jobs and only the last holds the token. That
+# does not by itself make a pull request's measurement safe to record: the
+# measuring job runs the branch's code whatever token it holds, so the numbers
+# it emits are the branch's to choose, and `lydite test record` verifies no
+# number. What makes this safe is *where* it runs — here the code has already
+# merged, passed review and passed every gate.
+#
+# Recording is worth doing because the baseline is keyed by tree. CI builds
+# `refs/pull/N/merge`, a squash merge lands a commit carrying that same tree, and
+# the next pull request's merge-base resolves to it — so the number this workflow
+# records is the one that pull request already measured, and every later change
+# reads it instead of measuring the base tree again. Without this workflow every
+# run is a cache miss: correct, slower, and the `record` row says so.
+#
+# It shards the way `lydite.yml` does — `plan` groups the components, a matrix
+# measures them, and one `record` folds every shard's measurements. No shard can
+# record: each measured part of the tree, and a partial baseline reads as a
+# cache hit on every later change, permanently. So the fold is where
+# completeness is decided, against the declaration read from the tree being
+# recorded.
+name: lydite-baseline
+
+on:
+  workflow_call:
+    inputs:
+      dir:
+        description: the scan root, relative to the workspace
+        type: string
+        required: false
+        default: "."
+      lydite-version:
+        description: which lydite release to run; `latest` resolves the newest
+        type: string
+        required: false
+        default: latest
+
+# One at a time. Two runs recording different trees is fine — they are different
+# keys — but two racing on the same one make the loser retry for nothing, and the
+# branch is shared with every other job that reads it.
+concurrency:
+  group: lydite-baseline
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    name: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      shards: ${{ steps.plan.outputs.shards }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: lydite/actions/setup@v1
+        with:
+          version: ${{ inputs.lydite-version }}
+
+      - uses: lydite/actions/plan@v1
+        id: plan
+        with:
+          dir: ${{ inputs.dir }}
+
+  measure:
+    name: measure (${{ matrix.shard.name }})
+    needs: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ${{ fromJSON(needs.plan.outputs.shards) }}
+    # Read-only, exactly as the pull-request matrix is. This job runs the
+    # repository's code; the one below holds the token and runs none of it.
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # On the default branch HEAD is its own merge-base, which still needs
+          # history to resolve at all.
+          fetch-depth: 0
+
+      - uses: lydite/actions/setup@v1
+        with:
+          version: ${{ inputs.lydite-version }}
+
+      # Deliberately not `affected`: the default-branch run has to be complete,
+      # since a forgotten `depends_on` edge is caught at merge or never.
+      # `component` narrows to this shard's slice and nothing else, so the
+      # matrix as a whole still runs every declared component.
+      - uses: lydite/actions/test@v1
+        with:
+          dir: ${{ inputs.dir }}
+          gate-coverage: true
+          component: ${{ matrix.shard.components }}
+          artifact-name: ${{ matrix.shard.name }}
+          artifact-prefix: lydite-shard
+
+  record:
+    name: record coverage baseline
+    needs: [plan, measure]
+    # It runs even when a shard failed. A gate that says nothing about coverage
+    # — orphans, watch, schedule — would otherwise discard a complete set of
+    # measurements, and no later run records this tree, because the next push
+    # carries a different one. `record` refuses a fold that is partial, names
+    # another tree, or was never written, so the worst an unconditional run does
+    # is say so.
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # The only job here that writes, and it runs nothing from the repository —
+    # no suite, no setup or teardown command, no compose service. Holding the
+    # token in a job that runs none of it is what keeps this workflow safe as it
+    # grows.
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - uses: lydite/actions/setup@v1
+        with:
+          version: ${{ inputs.lydite-version }}
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: lydite-shard-*
+          path: shards
+
+      # One write after the fold, never one per shard: N pushes racing one
+      # branch, and every shard's document partial by construction, so each
+      # would be refused.
+      - uses: lydite/actions/record@v1
+        with:
+          dir: ${{ inputs.dir }}
+          reports: shards

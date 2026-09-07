@@ -1,0 +1,64 @@
+# Groups every declared component into the shards a matrix runs one of.
+#
+# It assumes lydite is already on PATH — `lydite/actions/setup` puts it there.
+#
+# A shard is the set of components that must run in one process: two that
+# publish the same host port, or that are rooted at overlapping directories,
+# collide if they run at once, and the scheduler inside a single run is what
+# serialises them. Keeping such a pair together is safe on any runner topology —
+# two matrix jobs on hosted runners are separate machines and would not collide,
+# but self-hosted runners routinely place several jobs on one host, and then
+# they do.
+#
+# `lydite test plan` reads `.lydite/components.yml` and each component's compose
+# file, and nothing else: no git, no network, no process. So this job needs no
+# history, no container runtime and no `fetch-depth: 0` — and it cannot narrow
+# by `--affected`, which needs a merge-base. The shards narrow instead, each
+# passing `--affected` alongside the slice it owns.
+#
+# There is nothing to set. The grouping is the finest one that is safe, so a
+# repository whose components conflict with nothing gets one shard each, and a
+# repository declaring one component gets the single job it has today.
+name: lydite test plan
+description: Emit the shard matrix a lydite test or record run is sharded over
+
+inputs:
+  dir:
+    description: the scan root, relative to the workspace
+    required: false
+    default: "."
+
+outputs:
+  shards:
+    description: >
+      the matrix, as JSON: one `{name, components}` object per shard, where
+      `components` is the comma-separated list a job passes to `--component`
+    value: ${{ steps.plan.outputs.shards }}
+
+runs:
+  using: composite
+  steps:
+    # Every value reaches the script through env. Interpolating `${{ }}` into a
+    # run body is a script-injection vector, and Semgrep's
+    # yaml.github-actions.security.run-shell-injection rule has caught exactly
+    # that mistake in a lydite action before.
+    - id: plan
+      shell: bash
+      env:
+        DIR: ${{ inputs.dir }}
+      run: |
+        set -euo pipefail
+        lydite test plan --dir "${DIR}" --out "${RUNNER_TEMP}/lydite-matrix.json"
+        # The delimiter form, not `shards=<value>`. The matrix is derived from
+        # `.lydite/components.yml`, which on a pull request the change under
+        # test owns, and the single-line form lets a newline in that value open
+        # a second output entry. The delimiter is generated per run so the
+        # property is self-contained: a fixed literal would rest on the value
+        # never containing that exact line, which is a guarantee held somewhere
+        # other than here.
+        delim="LYDITE_MATRIX_$(openssl rand -hex 16)"
+        {
+          echo "shards<<${delim}"
+          cat "${RUNNER_TEMP}/lydite-matrix.json"
+          echo "${delim}"
+        } >> "${GITHUB_OUTPUT}"
