@@ -8,8 +8,6 @@
 # failure that actually happens here — a YAML edit that breaks every consumer's
 # workflow at once, with no local build step to catch it first.
 #
-# TODO: add actionlint, pinned to an exact version and verified by checksum the
-# way lydite pins every tool it runs.
 name: ci-test
 
 on:
@@ -24,6 +22,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: reviewdog/action-actionlint@8b682e1e7e512151d73a6b9449cbff173846226e # v1.74.0
+        with:
+          reporter: local
+          fail_level: error
 
       - name: validate composite actions
         run: |
