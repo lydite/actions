@@ -1,4 +1,10 @@
-# Renders lydite's standing pull-request comment and posts it.
+# Renders lydite's standing pull-request comment, posts it, and reconciles the
+# pull request's review threads with the run's located findings.
+#
+# Both surfaces are rendered from one list of report directories, and a finding
+# is in exactly one of them — the comment carries what is true of the change, a
+# thread what is true of a line. One action posts both because that list is
+# what they have to agree on, and because a consumer wires one entry point.
 #
 # It assumes lydite is already on PATH — `lydite/actions/setup` puts it there.
 #
@@ -6,9 +12,10 @@
 # `lydite publish` renders and posts nothing: it takes report directories and
 # writes a file, with no network, no token and no knowledge of a hosting
 # platform. Posting takes a file and a marker and knows nothing about coverage,
-# components or verdicts. So refining what the comment says never needs a
-# release of this action, and a developer can run `lydite publish` locally and
-# read exactly what a reviewer will see.
+# components or verdicts. `lydite threads` computes the whole thread delta, so
+# the steps below carry it and decide nothing about it. So refining what either
+# surface says never needs a release of this action, and a developer can run
+# `lydite publish` locally and read exactly what a reviewer will see.
 #
 # Two identities, and the second is required rather than a stopgap:
 #
@@ -32,7 +39,9 @@
 # Nothing interpolates an expression into a `run:` body. A comment body is the
 # most attacker-shaped value here: it quotes a pull request's own source.
 name: lydite publish
-description: Render lydite's standing pull-request comment from a run's reports, and post it
+description: >
+  Render lydite's standing pull-request comment from a run's reports, post it,
+  and open, answer and close the review threads those reports call for
 
 inputs:
   reports:
@@ -140,6 +149,37 @@ runs:
           echo "${delim}"
         } >> "${GITHUB_OUTPUT}"
 
+    # The fallback is required rather than a stopgap, but it is not the answer
+    # to every status. A consumer who has installed nothing still gets a
+    # comment, from `github-actions[bot]`, and the only thing they lose is
+    # whose name is on it; a consumer who has configured the relay wrongly gets
+    # a red step instead, because a fallback there posts the right verdict
+    # under the wrong byline on every run and never once says so. So the
+    # relay's answer sorts into three:
+    #
+    #   - No relay configured, or 409 — the app is not installed on this
+    #     repository. Both fall back silently; the second is the ordinary state
+    #     of every repository that has not opted in.
+    #   - A 5xx, or curl's `000` for a relay it could not reach at all. Falls
+    #     back, under a `::warning::`: a lydite outage must not fail a
+    #     consumer's pull request, and must not pass unremarked either.
+    #   - Anything else — 401 for a token the relay would not verify, 400 for a
+    #     payload it would not read, 403 for a run whose `ref` is not a pull
+    #     request's or whose number does not match it. Each is deterministic,
+    #     so the next run answers the same. The step fails.
+    #
+    # The two failures that reach a red step are therefore the relay refusing
+    # loudly and a payload this action sent that no relay could apply, and
+    # neither is fixed by trying again.
+    #
+    # `/comment` is stricter about 403 than `/review` is, and deliberately: the
+    # id-not-on-this-pull-request check that makes a 403 ambiguous exists only
+    # on `/review`, so a 403 here can only be the ref or the number, and only
+    # here can a 403 be failed on without failing a live race.
+    #
+    # A fork's pull request is untouched by any of this. It cannot mint an OIDC
+    # token, so it fails at the mint below, under `set -e`, before a status
+    # exists to sort.
     - id: relay
       if: inputs.relay != ''
       shell: bash
@@ -178,8 +218,24 @@ runs:
           echo "posted=true" >> "${GITHUB_OUTPUT}"
           exit 0
         fi
-        echo "posted=false" >> "${GITHUB_OUTPUT}"
-        echo "the relay answered ${status}; falling back to this workflow's token" >&2
+        case "${status}" in
+          409)
+            echo "posted=false" >> "${GITHUB_OUTPUT}"
+            echo "the relay answered ${status}; falling back to this workflow's token" >&2
+            ;;
+          000|5??)
+            echo "posted=false" >> "${GITHUB_OUTPUT}"
+            echo "::warning::the relay answered ${status}; falling back to this workflow's token" >&2
+            ;;
+          *)
+            # No `posted` output: the step's own failure is the whole of what
+            # this branch says, and it skips the fallback step below rather
+            # than choosing for it.
+            echo "::error::the relay answered ${status}; this is a configuration problem, not an outage, so it fails the step rather than falling back" >&2
+            cat "${RUNNER_TEMP}/relay-out.json" >&2 || true
+            exit 1
+            ;;
+        esac
         cat "${RUNNER_TEMP}/relay-out.json" >&2 || true
 
     - if: steps.relay.outputs.posted != 'true'
@@ -224,3 +280,110 @@ runs:
             -F "body=@${BODY_FILE}" --silent
           echo "created a comment"
         fi
+
+    # The threads follow the comment, so a run that can post only one of the
+    # two posts the one carrying the verdict. They read the same directories
+    # the comment was rendered from, and a finding is in exactly one of the two
+    # surfaces — the comment carries what is true of the change, a thread what
+    # is true of a line — so a list that differed between them would drop a
+    # finding from both or put it in each.
+    #
+    # The delta is `lydite threads`' either way: it reads the reports, fetches
+    # the threads already standing and writes the operations document. What
+    # differs between the relay and the fallback is only who applies it, which
+    # is why the relay never learns which fingerprint belongs to which thread.
+    # Reading the prior state uses the workflow's own token on both paths.
+    - id: threads
+      if: inputs.relay != ''
+      shell: bash
+      env:
+        REPORTS: ${{ steps.render.outputs.dirs }}
+        OPS: ${{ runner.temp }}/lydite-threads.json
+        GITHUB_TOKEN: ${{ inputs.token }}
+      run: |
+        set -euo pipefail
+        args=()
+        while IFS= read -r dir; do
+          [ -n "${dir}" ] && args+=(--reports "${dir}")
+        done <<< "${REPORTS}"
+        lydite threads "${args[@]}" --ops "${OPS}"
+
+    # The same three-way sort the comment's relay step makes, with one
+    # difference: a 403 falls back here instead of failing. `/review` has a
+    # third cause for one that `/comment` has not — an operation naming a
+    # review comment that is no longer on the pull request. The relay re-reads
+    # those ids at apply time, so a thread deleted between the delta and the
+    # apply is a live race that the recomputed delta below settles, and a
+    # rejection carries no detail, so nothing at this layer can tell that 403
+    # from the ref or number mismatch that deserves a red step. The ambiguity
+    # is resolved toward the fallback, which costs a misconfigured `/review`
+    # its loud failure and keeps a race from failing a job.
+    - id: threads-relay
+      if: inputs.relay != ''
+      shell: bash
+      env:
+        OPS: ${{ runner.temp }}/lydite-threads.json
+        RELAY: ${{ inputs.relay }}
+      run: |
+        set -euo pipefail
+
+        # The audience is the relay's own origin, so a token minted here cannot
+        # be replayed against another service — and the relay refuses one whose
+        # audience is not its own.
+        token=$(curl -fsS \
+          -H "Authorization: Bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+          "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=${RELAY}" | jq -r '.value')
+
+        # The document goes as it was written. The repository is deliberately
+        # not sent — the relay takes it from the verified claim, so there is
+        # nothing here that could name another one.
+        status=$(curl -sS -o "${RUNNER_TEMP}/relay-review.json" -w '%{http_code}' \
+          -X POST "${RELAY}/review" \
+          -H "Authorization: Bearer ${token}" \
+          -H 'content-type: application/json' \
+          --data-binary "@${OPS}") || status=000
+
+        if [ "${status}" = "200" ]; then
+          echo "applied=true" >> "${GITHUB_OUTPUT}"
+          cat "${RUNNER_TEMP}/relay-review.json"
+          exit 0
+        fi
+        case "${status}" in
+          409)
+            echo "applied=false" >> "${GITHUB_OUTPUT}"
+            echo "the relay answered ${status}; falling back to this workflow's token" >&2
+            ;;
+          000|403|5??)
+            echo "applied=false" >> "${GITHUB_OUTPUT}"
+            echo "::warning::the relay answered ${status}; falling back to this workflow's token" >&2
+            ;;
+          *)
+            # No `applied` output: the step's own failure is the whole of what
+            # this branch says, and it skips the fallback step below rather
+            # than choosing for it.
+            echo "::error::the relay answered ${status}; this is a configuration problem, not an outage, so it fails the step rather than falling back" >&2
+            cat "${RUNNER_TEMP}/relay-review.json" >&2 || true
+            exit 1
+            ;;
+        esac
+        cat "${RUNNER_TEMP}/relay-review.json" >&2 || true
+
+    # The delta is recomputed rather than the document replayed, because the
+    # threads may have moved while the relay was being tried and a stale
+    # document would answer a thread that is no longer there. It ends in a
+    # non-zero exit when the platform refuses the review, which fails the job:
+    # a run whose located findings reached no surface must never read as a
+    # change with nothing wrong with it.
+    - if: steps.threads-relay.outputs.applied != 'true'
+      shell: bash
+      env:
+        REPORTS: ${{ steps.render.outputs.dirs }}
+        OPS: ${{ runner.temp }}/lydite-threads.json
+        GITHUB_TOKEN: ${{ inputs.token }}
+      run: |
+        set -euo pipefail
+        args=()
+        while IFS= read -r dir; do
+          [ -n "${dir}" ] && args+=(--reports "${dir}")
+        done <<< "${REPORTS}"
+        lydite threads "${args[@]}" --ops "${OPS}" --apply
