@@ -31,6 +31,11 @@ jobs:
         with:
           reporter: local
           fail_level: error
+          # The default filter_mode, "file", scopes findings to a diff, which
+          # this reporter has none to compute (it prints to stdout rather than
+          # a PR review) and fails outright for want of one. Every finding in
+          # every workflow file matters here, changed or not.
+          filter_mode: nofilter
 
       - name: validate composite actions
         run: |
