@@ -23,10 +23,12 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      # actionlint itself is not fetched at run time: this action runs as a
-      # Docker image pinned by digest (see its action.yml), with actionlint
-      # built into that image at a fixed version. The commit SHA above pins
-      # both the image reference and the actionlint version together.
+      # actionlint itself is not fetched at run time: at this commit,
+      # `runs.image` is `docker://ghcr.io/reviewdog/action-actionlint:v1.74.0
+      # @sha256:9335d1d3f46c26e5be435f56968f2b5a6389726eb8e6612e3f02a7be3eb981c3`,
+      # with actionlint built into that image at a fixed version. The commit
+      # SHA above pins both the image reference and the actionlint version
+      # together.
       - uses: reviewdog/action-actionlint@8b682e1e7e512151d73a6b9449cbff173846226e # v1.74.0
         with:
           reporter: local
