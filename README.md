@@ -221,7 +221,7 @@ referred, which is the correct day-one state.
 Pin the floating major, `@v1`. A release moves it to the tagged commit, so the reusable
 workflow and the actions it calls always ship together.
 
-`@v1` calls `lydite review`, `test`, `merge`, `record` and `publish`. Using it requires a lydite
-release that ships those commands — the only lydite release today, `v0.1.0`, ships `scan`,
-`coverage`, `version` and `update`, and neither `lydite-version: latest` nor `@v1` as it stands
-resolves those five commands end to end against it.
+`@v1` calls `lydite review`, `test`, `merge`, `record`, `publish` and `threads`. Using it requires
+a lydite release that ships those commands — the only lydite release today, `v0.1.0`, ships
+`scan`, `coverage`, `version` and `update`, and neither `lydite-version: latest` nor `@v1` as it
+stands resolves those six commands end to end against it.
