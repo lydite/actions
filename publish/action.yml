@@ -116,7 +116,7 @@ runs:
             args+=(--reports "${dir%/}")
             dirs+=("${dir%/}")
           done
-        elif [ -d "${root}" ]; then
+        elif [ -d "${root}" ] && [ -n "$(find "${root}" -mindepth 1 -print -quit)" ]; then
           args+=(--reports "${root}")
           dirs+=("${root}")
         fi
