@@ -21,9 +21,17 @@ jobs:
       pull-requests: write   # the fallback that posts as github-actions[bot]
 ```
 
-That runs the referral, the scan and the gated suites in parallel and renders **one standing
-comment** from all three. It has to be one run: the comment is assembled from every job's
-reports, so they have to be artifacts of the same run.
+```
+referral ──────────────────────┐   no needs, so the status lands in seconds
+scan ──────────────────────────┤
+plan ─┬─► test (matrix) ───────► merge
+      └─► mutation (matrix) ───► mutation-merge
+                               └─► publish   needs all, if: always()
+```
+
+That runs the referral, the scan, the gated suites and the mutation matrix in parallel and
+renders **one standing comment** from all four. It has to be one run: the comment is assembled
+from every job's reports, so they have to be artifacts of the same run.
 
 Inputs: `dir`, `lydite-version`, `gate-coverage`, `affected`, `relay`. Secret:
 `semgrep-token`.
@@ -45,6 +53,18 @@ which an `unmeasured` row would otherwise let publish as a passing verdict over 
 half of which was never tested. It is also the only thing that can compute `coverage(repo)` and
 `patch(repo)`: both sum every component's counts, and a shard holding two of four would answer
 about its own two under a label about the repository.
+
+**Mutation runs beside the test matrix, on the same shards, and there is no way to decline it.**
+It reuses `plan`'s output verbatim rather than running as a phase inside `test`, since mutation
+and the coverage gate share a checkout and not a compilation, and a `mutation-merge` job folds
+the shards' documents the same way `merge` does — a component with no row is a shard whose job
+died, and there is no repository-wide figure to compute beyond that, since survived == 0 for
+every component is survived == 0 for the repository. A mutant is a full suite run, so a
+component's budget is its mutant count times its own suite, and nothing inside lydite caps that:
+the mutation job's timeout is 60 minutes, twice the test matrix's 30, and lydite/lydite#97
+measured a 1,276-line change at 54 minutes against it — a large change can run close to that
+limit. Every pull request gets a mutation section in the comment; there is no input that skips
+this job.
 
 ## Recording the baseline, after the merge
 
@@ -83,6 +103,15 @@ again in a throwaway worktree. Wiring `gate-coverage` and never recording is a s
 configuration: every run stays correct, every run pays that measurement, and the `record` row
 says so.
 
+**The baseline workflow also runs a whole-repository scan.** There is no diff to scope it to on
+a push to the default branch, so it passes no `diff-base` and gets the repository's standing
+finding count back. `record` folds that count in alongside the coverage measurements, into the
+same quality-history entry, and it does so unconditionally: a red scan does not block the run
+from being recorded, because the count is the thing worth preserving, permanently, not a pass or
+fail on this branch. A consumer calling `record@v1` directly rather than through
+`lydite-baseline.yml` must pass its `branch` input explicitly — `record` verifies no number, so
+it has nothing to infer that key from, and no default is safe to guess.
+
 ## Or the pieces
 
 Every action assumes lydite is already on `PATH`, so a workflow running more than one
@@ -95,7 +124,9 @@ installs once.
 | `lydite/actions/scan@v1` | runs the SAST and SCA checks over every declared component |
 | `lydite/actions/plan@v1` | emits the shard matrix, from the declaration alone |
 | `lydite/actions/test@v1` | runs the suites a job is responsible for, and gates their coverage |
+| `lydite/actions/mutation@v1` | mutates the components a job is responsible for, and uploads the reports |
 | `lydite/actions/merge@v1` | folds every shard's report into one, and decides completeness |
+| `lydite/actions/mutation-merge@v1` | folds every shard's mutation report into one, and decides completeness |
 | `lydite/actions/record@v1` | lands a run's measurements as the baseline on the `lydite` branch |
 | `lydite/actions/publish@v1` | renders the standing comment from the reports, posts it, and opens, answers and closes the pull request's review threads |
 
@@ -221,7 +252,11 @@ referred, which is the correct day-one state.
 Pin the floating major, `@v1`. A release moves it to the tagged commit, so the reusable
 workflow and the actions it calls always ship together.
 
-`@v1` calls `lydite review`, `test`, `merge`, `record`, `publish` and `threads`. Using it requires
-a lydite release that ships those commands — the only lydite release today, `v0.1.0`, ships
-`scan`, `coverage`, `version` and `update`, and neither `lydite-version: latest` nor `@v1` as it
-stands resolves those six commands end to end against it.
+`@v1` calls `lydite review`, `test`, `merge`, `record`, `publish`, `threads`, `mutation` and
+`mutation merge`, and `record` calls `test record --branch`. Using it requires a lydite release
+that ships all of those — the only lydite release today, `v0.1.0`, ships `scan`, `coverage`,
+`version` and `update`, and neither `lydite-version: latest` nor `@v1` as it stands resolves any
+of the rest against it. `lydite mutation`, `lydite mutation merge` and `lydite test record
+--branch` do not exist in that release either, so `@v1` must not move to the commit that
+introduced the mutation matrix and the branch-keyed `record` until a later lydite release
+carries those commands too.
