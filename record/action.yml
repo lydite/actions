@@ -55,10 +55,6 @@ runs:
   steps:
     # Every value reaches the script through env. Interpolating `${{ }}` into a
     # run body is a script-injection vector.
-    #
-    # The directories are named and lydite names its own files inside them.
-    # Nothing here knows what the measurement document is called, so a rename
-    # of it is not a release of this repository.
     - shell: bash
       env:
         DIR: ${{ inputs.dir }}
@@ -67,13 +63,36 @@ runs:
         set -euo pipefail
         shopt -s nullglob
 
+        # `record` needs the document, so the document is what is looked for.
+        # actions/download-artifact gives an artifact its own subdirectory only
+        # when the pattern matched more than one, and extracts a lone match
+        # straight into `path` — so a run with one shard, or one scan job,
+        # leaves its document directly under ${REPORTS}, where a `*/` glob
+        # never looks. That glob then offers the shard's own per-component log
+        # directory instead, and the fold records no measurement while staying
+        # green saying so. Depth 2 reaches both shapes and stops above the
+        # per-component directories, which hold logs and coverage reports
+        # rather than either document.
+        #
+        # `merge-multiple: true` on the download that produced ${REPORTS} is
+        # not the fix: it puts every shard's `measurements.json` at one path,
+        # and the per-shard separation it collapses is what completeness is
+        # re-checked from here.
         args=()
-        for dir in "${REPORTS%/}"/*/; do
-          args+=(--reports "${dir%/}")
-        done
-        if [ "${#args[@]}" -eq 0 ]; then
-          echo "::error::no shard uploaded a report directory under ${REPORTS}; there is nothing to record"
+        dirs=()
+        while IFS= read -r dir; do
+          args+=(--reports "${dir}")
+          dirs+=("${dir}")
+        done < <(find "${REPORTS%/}" -maxdepth 2 \
+                   \( -name measurements.json -o -name scan.json \) \
+                   -exec dirname {} \; | sort -u)
+        if [ "${#dirs[@]}" -eq 0 ]; then
+          echo "::error::no shard uploaded a measurements or scan document under ${REPORTS}; there is nothing to record"
           exit 1
         fi
+
+        # Named out loud, because the defect this guards against is a fold
+        # reading a directory nobody meant it to and saying nothing.
+        printf 'folding %s\n' "${dirs[@]}"
 
         lydite test record --dir "${DIR}" "${args[@]}"

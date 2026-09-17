@@ -55,24 +55,54 @@ runs:
         set -euo pipefail
         shopt -s nullglob
 
+        # Found by the documents rather than by the directory layout, because
+        # the layout is not ours to predict: actions/download-artifact gives an
+        # artifact its own subdirectory only when the pattern matched more than
+        # one, and extracts a lone match straight into `path`. A repository
+        # planning one shard therefore leaves `measurements.json` directly
+        # under ${REPORTS}, where a `*/` glob never looks — it finds that
+        # shard's per-component log directories instead and folds one of those.
+        # Depth 2 reaches both shapes and stops above the per-component
+        # directories, which hold logs and coverage reports rather than either
+        # document.
+        #
+        # `merge-multiple: true` on the download that produced ${REPORTS} is
+        # not the fix: it puts every shard's `measurements.json` at one path,
+        # and the per-shard separation it collapses is what completeness is
+        # decided from.
         args=()
-        for dir in "${REPORTS%/}"/*/; do
-          args+=(--reports "${dir%/}")
-        done
+        dirs=()
+        while IFS= read -r dir; do
+          args+=(--reports "${dir}")
+          dirs+=("${dir}")
+        done < <(find "${REPORTS%/}" -maxdepth 2 \
+                   \( -name measurements.json -o -name test.json \) \
+                   -exec dirname {} \; | sort -u)
         if [ "${#args[@]}" -eq 0 ]; then
           echo "::error::no shard uploaded a report directory under ${REPORTS}; there is nothing to fold"
           exit 1
         fi
+
+        # Named out loud: a fold reading a directory nobody meant it to folds
+        # something, and what tells that apart from a fold that read the right
+        # one is which paths were there to be read.
+        printf 'folding %s\n' "${dirs[@]}"
 
         # Each shard's component subdirectories are copied in first. The folded
         # rows carry the shards' own `log` paths, and `publish` resolves those
         # against the directory it is given — this one. Without the copy a red
         # component's row in the comment names a log that is in an artifact
         # `publish` deliberately never downloads, and carries no tail at all.
+        #
+        # The component subdirectories of each shard that was found, rather
+        # than a glob of a fixed depth: a lone shard's sit directly under
+        # ${REPORTS}, and every other shard's one level below that.
         out="${DIR%/}/.lydite-reports"
         mkdir -p "${out}"
-        for logs in "${REPORTS%/}"/*/*/; do
-          cp -R "${logs}" "${out}/"
+        for dir in "${dirs[@]}"; do
+          for logs in "${dir}"/*/; do
+            cp -R "${logs}" "${out}/"
+          done
         done
 
         # The verdict over the whole repository is this step's, so the exit code

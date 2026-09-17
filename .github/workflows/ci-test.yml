@@ -8,8 +8,6 @@
 # failure that actually happens here — a YAML edit that breaks every consumer's
 # workflow at once, with no local build step to catch it first.
 #
-# TODO: add actionlint, pinned to an exact version and verified by checksum the
-# way lydite pins every tool it runs.
 name: ci-test
 
 on:
@@ -24,6 +22,20 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # actionlint itself is not fetched at run time: this action's `runs`
+      # block uses a Docker image pinned by digest, with actionlint built
+      # into that image at a fixed version, so the commit SHA above pins
+      # both the image reference and the actionlint version together.
+      - uses: reviewdog/action-actionlint@8b682e1e7e512151d73a6b9449cbff173846226e # v1.74.0
+        with:
+          reporter: local
+          fail_level: error
+          # The default filter_mode, "file", scopes findings to a diff, which
+          # this reporter has none to compute (it prints to stdout rather than
+          # a PR review) and fails outright for want of one. Every finding in
+          # every workflow file matters here, changed or not.
+          filter_mode: nofilter
 
       - name: validate composite actions
         run: |

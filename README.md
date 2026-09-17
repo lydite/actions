@@ -17,7 +17,7 @@ jobs:
     permissions:
       contents: read
       statuses: write        # the lydite/referral commit status
-      id-token: write        # the comment relay; not a credential
+      id-token: write        # the comment and review-thread relay; not a credential
       pull-requests: write   # the fallback that posts as github-actions[bot]
 ```
 
@@ -97,13 +97,20 @@ installs once.
 | `lydite/actions/test@v1` | runs the suites a job is responsible for, and gates their coverage |
 | `lydite/actions/merge@v1` | folds every shard's report into one, and decides completeness |
 | `lydite/actions/record@v1` | lands a run's measurements as the baseline on the `lydite` branch |
-| `lydite/actions/publish@v1` | renders the standing comment from the reports, and posts it |
+| `lydite/actions/publish@v1` | renders the standing comment from the reports, posts it, and opens, answers and closes the pull request's review threads |
 
 `review`, `scan`, `test` and `merge` each upload their `.lydite-reports` as
 `lydite-reports-<name>`, and `publish` reads those back. A `test` job that holds one shard of a
 matrix passes `artifact-prefix: lydite-shard` instead, so `merge` and `record` can read its
 document and `publish` never renders it as a `test` section of its own — there would be one per
 shard, each answering about part of the repository under one heading.
+
+`publish` folds whatever `download-artifact` produced without asking which shape it is. A
+pattern matching more than one artifact gets each its own `lydite-reports-<name>` subdirectory;
+a pattern matching exactly one — the one-job pipeline, with no matrix at all — leaves that job's
+contents directly under the reports directory, with no subdirectory to find. `publish` looks for
+the nested shape structurally and falls back to the flat one, so a single-job pipeline needs no
+different wiring than a sharded one to fold correctly.
 
 ```yaml
 - uses: actions/checkout@v5
@@ -185,6 +192,25 @@ decides what may be written from the claims GitHub signed. Without one it posts 
 `github-actions[bot]`. That fallback is required rather than a stopgap — a consumer who has
 installed nothing still gets the surface, and the only thing they lose is whose name is on it.
 
+**The same run also reconciles the pull request's review threads.** `publish` reads the run's
+located findings from the same report directories the comment was rendered from and opens,
+answers and closes one thread per line-level finding, so a change to what got found never has
+to be read twice — once in the comment, once per line — to be understood. This uses the same
+`relay` input as the comment: with one configured, threads are opened and closed as **lydite**;
+without one, they go through the workflow's own token instead.
+
+**A relay's answer to either surface sorts into the same three outcomes.** `409` falls back
+silently — no app installed on this repository is the ordinary state, not a fault. `000` (the
+relay was unreachable at all) or a `5xx` falls back too, but under a `::warning::`: a relay
+outage must not fail a consumer's pull request, and must not pass unremarked either. Anything
+else — a token the relay would not verify, a payload it would not read, a run whose pull request
+does not match its claims — is deterministic, so retrying answers the same, and the step fails
+rather than posting under the wrong byline. The one asymmetry is `403`: on the review-thread
+call it falls back like an outage, because the relay re-reads a thread's id when it applies the
+operation and a `403` there can be a thread that moved between the delta being computed and
+being applied rather than a real rejection; on the comment call there is no such race, so a
+`403` fails the step.
+
 **A referral is not a failure.** `lydite review` runs no check. It says whether a change may
 merge unattended, and a referral names no defect — it says a person has to look, and they
 resolve it by commenting `/lydite clear`. With no `.lydite/exemptions.yml`, every change is
@@ -194,3 +220,8 @@ referred, which is the correct day-one state.
 
 Pin the floating major, `@v1`. A release moves it to the tagged commit, so the reusable
 workflow and the actions it calls always ship together.
+
+`@v1` calls `lydite review`, `test`, `merge`, `record`, `publish` and `threads`. Using it requires
+a lydite release that ships those commands — the only lydite release today, `v0.1.0`, ships
+`scan`, `coverage`, `version` and `update`, and neither `lydite-version: latest` nor `@v1` as it
+stands resolves those six commands end to end against it.
