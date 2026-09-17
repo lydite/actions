@@ -1,8 +1,11 @@
 # The fold every shard-matrix action performs, in one place.
 #
-# Private to this repository: it is reached only through a relative
-# `uses: ./.github/actions/fold`, and is not one of the per-command actions a
-# consumer names. What varies between the callers is which documents identify a
+# Private to this repository: it is reached only through
+# `lydite/actions/.github/actions/fold@v1`, repo-qualified and pinned like every
+# other cross-action reference here — a relative `uses:` inside a composite
+# action resolves against the consuming repository's checkout, not this one —
+# and it is not one of the per-command actions a consumer names. What varies
+# between the callers is which documents identify a
 # shard's report directory, which lydite subcommand reads them, and whether the
 # folded reports go on to a comment; the finding, the reporting and the exit
 # status do not, and a second copy of them is a second place for the shapes

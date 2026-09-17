@@ -52,6 +52,12 @@ inputs:
       responsible for every declared one. A shard matrix passes its own slice.
     required: false
     default: ""
+  base-branch:
+    description: >
+      the branch a merge-base is resolved against. Pass `github.base_ref` on a
+      pull request; empty lets lydite discover the default branch.
+    required: false
+    default: ""
   concurrency:
     description: how many components may run at once; empty keeps lydite's own default
     required: false
@@ -100,6 +106,7 @@ runs:
         DIR: ${{ inputs.dir }}
         AFFECTED: ${{ inputs.affected }}
         COMPONENT: ${{ inputs.component }}
+        BASE_BRANCH: ${{ inputs.base-branch }}
         CONCURRENCY: ${{ inputs.concurrency }}
       run: |
         set -euo pipefail
@@ -109,6 +116,9 @@ runs:
         fi
         if [ -n "${COMPONENT}" ]; then
           args+=(--component "${COMPONENT}")
+        fi
+        if [ -n "${BASE_BRANCH}" ]; then
+          args+=(--base-branch "${BASE_BRANCH}")
         fi
         if [ -n "${CONCURRENCY}" ]; then
           args+=(--concurrency "${CONCURRENCY}")

@@ -46,7 +46,11 @@ runs:
     # The finding, the reporting and the exit status are the shared fold's;
     # what is this action's is which documents mark a report directory, which
     # command reads them, and that the folded reports become a comment section.
-    - uses: ./.github/actions/fold
+    #
+    # Repo-qualified and pinned, never `./.github/actions/fold`: a relative
+    # `uses:` inside a composite action resolves against the consuming
+    # repository's checkout, where this action's own tree is not.
+    - uses: lydite/actions/.github/actions/fold@v1
       with:
         dir: ${{ inputs.dir }}
         reports: ${{ inputs.reports }}

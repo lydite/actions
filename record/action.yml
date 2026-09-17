@@ -70,7 +70,11 @@ runs:
     # are a measurement or a scan, that nothing here is published — so no
     # component subdirectory is copied and no artifact is uploaded — and the
     # branch the entry lands under.
-    - uses: ./.github/actions/fold
+    #
+    # Repo-qualified and pinned, never `./.github/actions/fold`: a relative
+    # `uses:` inside a composite action resolves against the consuming
+    # repository's checkout, where this action's own tree is not.
+    - uses: lydite/actions/.github/actions/fold@v1
       with:
         dir: ${{ inputs.dir }}
         reports: ${{ inputs.reports }}

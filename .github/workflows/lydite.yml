@@ -263,6 +263,7 @@ jobs:
           # itself and the flag only obscures the intent.
           affected: ${{ inputs.affected && github.event_name == 'pull_request' }}
           component: ${{ matrix.shard.components }}
+          base-branch: ${{ github.event_name == 'pull_request' && github.base_ref || '' }}
           # Under its own prefix, so `publish` never reads a shard's document as
           # a `mutation` section of its own: there would be one per shard, each
           # answering about part of the repository under one heading.
