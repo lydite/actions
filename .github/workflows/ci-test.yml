@@ -42,7 +42,10 @@ jobs:
           python3 - <<'PY'
           import glob, sys, yaml
 
-          found = glob.glob("*/action.yml") + glob.glob("*/action.yaml")
+          found = (
+              glob.glob("*/action.yml") + glob.glob("*/action.yaml")
+              + glob.glob(".github/actions/*/action.yml") + glob.glob(".github/actions/*/action.yaml")
+          )
           if not found:
               sys.exit("no action.yml found — this check is testing nothing")
 
