@@ -1,0 +1,58 @@
+# Folds a shard matrix's mutation documents back into one, and uploads the
+# result as the `mutation` section of the comment.
+#
+# It assumes lydite is already on PATH — `lydite/actions/setup` puts it there.
+#
+# This is the completeness check, and it is the reason the shards may each report
+# only what they own. Every declared component takes exactly one row across the
+# matrix, so a component with no row is a shard whose job died and a component
+# with two is two jobs running the same work — both failures, and neither is
+# `unmeasured`, which does not vote and would publish a passing verdict over a
+# repository half of which was never mutated.
+#
+# Unlike the test fold it computes no figure over the repository: there is none
+# to compute, since survived == 0 for every component is survived == 0 for the
+# repository. What it adds to the shards' rows is the summary row.
+#
+# It needs a checkout, because completeness is a question about the declaration
+# and the declaration is read from the tree.
+name: lydite mutation merge
+description: Fold every shard's lydite mutation report into one, and upload it for a later publish
+
+inputs:
+  dir:
+    description: the scan root, relative to the workspace
+    required: false
+    default: "."
+  reports:
+    description: >
+      directory holding one subdirectory per shard's uploaded reports, as
+      `actions/download-artifact` with a `lydite-mutation-shard-*` pattern
+      produces
+    required: false
+    default: shards
+  upload-reports:
+    description: upload the folded .lydite-reports as an artifact for a later `publish`
+    required: false
+    default: "true"
+  artifact-name:
+    description: which section of the comment these reports become
+    required: false
+    default: mutation
+
+runs:
+  using: composite
+  steps:
+    # The finding, the reporting and the exit status are the shared fold's;
+    # what is this action's is which documents mark a report directory, which
+    # command reads them, and that the folded reports become a comment section.
+    - uses: ./.github/actions/fold
+      with:
+        dir: ${{ inputs.dir }}
+        reports: ${{ inputs.reports }}
+        doc-names: mutation.json
+        copy-components: "true"
+        command: mutation merge
+        error-message: "no shard uploaded a report directory under ${{ inputs.reports }}; there is nothing to fold"
+        upload-reports: ${{ inputs.upload-reports }}
+        artifact-name: ${{ inputs.artifact-name }}
