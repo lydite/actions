@@ -18,13 +18,22 @@
 #
 # Every value arrives through the environment, because interpolating `${{ }}`
 # into a run body is a script-injection vector: DIR, REPORTS, DOC_NAMES,
-# COPY_COMPONENTS, COMMAND, EXTRA_ARGS, ERROR_MESSAGE.
+# COPY_COMPONENTS, COMMAND, EXTRA_ARGS, BRANCH, ERROR_MESSAGE.
 #
 # `COMMAND` and `EXTRA_ARGS` are word-split deliberately: a caller writes them
 # as a literal in its own `env:` block, so the words are the interface, not text
-# arriving from a fork.
+# arriving from a fork. `BRANCH` is the opposite and is passed as one quoted
+# argument: it is a value a caller forwards from its own input, so a space in it
+# is part of the branch name, and splitting on it would let whatever supplied
+# that input append arguments of its own to a command running in the one job
+# holding `contents: write`. Anything flowing from another action's input
+# belongs in a variable of its own, never folded into EXTRA_ARGS.
 #
 # It assumes lydite is already on PATH — `lydite/actions/setup` puts it there.
+#
+# Every uppercase name below is one of those environment inputs, never a
+# misspelled local, which is the whole of what SC2153 reports here.
+# shellcheck disable=SC2153
 set -euo pipefail
 shopt -s nullglob
 
@@ -92,6 +101,9 @@ fi
 # so a failing fold still reaches the comment.
 read -r -a command_words <<< "${COMMAND}"
 read -r -a extra_args <<< "${EXTRA_ARGS:-}"
+if [ -n "${BRANCH:-}" ]; then
+  extra_args+=(--branch "${BRANCH}")
+fi
 status=0
 lydite "${command_words[@]}" --dir "${DIR}" "${args[@]}" "${extra_args[@]}" || status=$?
 echo "lydite ${COMMAND} exited ${status}"

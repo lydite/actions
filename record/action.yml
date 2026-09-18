@@ -79,6 +79,11 @@ runs:
     #
     # Every value reaches the script through env. Interpolating `${{ }}` into a
     # run body is a script-injection vector.
+    #
+    # The branch travels in `BRANCH` rather than in `EXTRA_ARGS`, which the
+    # script word-splits: a consumer calling this action directly supplies that
+    # input, and a space in it would otherwise become a second argument of its
+    # choosing to a command running with `contents: write`.
     - shell: bash
       env:
         ACTION_PATH: ${{ github.action_path }}
@@ -87,6 +92,6 @@ runs:
         DOC_NAMES: measurements.json scan.json
         COPY_COMPONENTS: "false"
         COMMAND: test record
-        EXTRA_ARGS: --branch ${{ inputs.branch }}
+        BRANCH: ${{ inputs.branch }}
         ERROR_MESSAGE: "no shard uploaded a measurements or scan document under ${{ inputs.reports }}; there is nothing to record"
       run: bash "${ACTION_PATH}/../.github/actions/fold/fold.sh"

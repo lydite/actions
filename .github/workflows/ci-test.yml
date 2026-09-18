@@ -37,6 +37,23 @@ jobs:
           # every workflow file matters here, changed or not.
           filter_mode: nofilter
 
+      # actionlint reads the shell embedded in a `run:` block; it does not
+      # follow a `bash <path>` invocation into the script that body names, and
+      # the YAML validation below checks shape rather than shell. Without this
+      # step the fold every shard-matrix action delegates to — the one place
+      # word-splitting, a built-up `find` expression and `cp -R` live — is the
+      # only shell in the repository nothing lints.
+      - name: shellcheck action scripts
+        run: |
+          shopt -s globstar nullglob
+          scripts=(.github/actions/**/*.sh)
+          if [ "${#scripts[@]}" -eq 0 ]; then
+            echo "::error::no .sh found under .github/actions — this check is testing nothing"
+            exit 1
+          fi
+          printf 'shellcheck %s\n' "${scripts[@]}"
+          shellcheck "${scripts[@]}"
+
       - name: validate composite actions
         run: |
           python3 - <<'PY'
