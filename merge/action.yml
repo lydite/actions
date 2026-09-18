@@ -49,16 +49,42 @@ runs:
     # what is this action's is which documents mark a report directory, which
     # command reads them, and that the folded reports become a comment section.
     #
-    # Repo-qualified and pinned, never `./.github/actions/fold`: a relative
-    # `uses:` inside a composite action resolves against the consuming
-    # repository's checkout, where this action's own tree is not.
-    - uses: lydite/actions/.github/actions/fold@v1
+    # The shared fold is a script reached through `github.action_path`, never a
+    # nested `uses:`: a composite-action reference carries its own ref, which
+    # GitHub resolves independently of the ref a consumer pinned this action to.
+    # `${ACTION_PATH}` is this directory inside the checkout that resolved this
+    # action, so the script is always the consumer's own ref.
+    #
+    # Every value reaches the script through env. Interpolating `${{ }}` into a
+    # run body is a script-injection vector.
+    - shell: bash
+      env:
+        ACTION_PATH: ${{ github.action_path }}
+        DIR: ${{ inputs.dir }}
+        REPORTS: ${{ inputs.reports }}
+        DOC_NAMES: measurements.json test.json
+        COPY_COMPONENTS: "true"
+        COMMAND: test merge
+        ERROR_MESSAGE: "no shard uploaded a report directory under ${{ inputs.reports }}; there is nothing to fold"
+      run: bash "${ACTION_PATH}/../.github/actions/fold/fold.sh"
+
+    - id: reports
+      if: ${{ always() && inputs.upload-reports == 'true' }}
+      shell: bash
+      env:
+        DIR: ${{ inputs.dir }}
+      run: |
+        path="${DIR%/}/.lydite-reports"
+        if [ -d "${path}" ]; then
+          echo "path=${path}" >> "${GITHUB_OUTPUT}"
+        else
+          echo "no ${path}: this job wrote no report" >&2
+        fi
+
+    - if: ${{ always() && steps.reports.outputs.path != '' }}
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
       with:
-        dir: ${{ inputs.dir }}
-        reports: ${{ inputs.reports }}
-        doc-names: measurements.json test.json
-        copy-components: "true"
-        command: test merge
-        error-message: "no shard uploaded a report directory under ${{ inputs.reports }}; there is nothing to fold"
-        upload-reports: ${{ inputs.upload-reports }}
-        artifact-name: ${{ inputs.artifact-name }}
+        name: lydite-reports-${{ inputs.artifact-name }}
+        path: ${{ steps.reports.outputs.path }}
+        retention-days: 7
+        include-hidden-files: true

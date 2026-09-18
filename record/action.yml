@@ -71,16 +71,22 @@ runs:
     # component subdirectory is copied and no artifact is uploaded — and the
     # branch the entry lands under.
     #
-    # Repo-qualified and pinned, never `./.github/actions/fold`: a relative
-    # `uses:` inside a composite action resolves against the consuming
-    # repository's checkout, where this action's own tree is not.
-    - uses: lydite/actions/.github/actions/fold@v1
-      with:
-        dir: ${{ inputs.dir }}
-        reports: ${{ inputs.reports }}
-        doc-names: measurements.json scan.json
-        copy-components: "false"
-        command: test record
-        extra-args: --branch ${{ inputs.branch }}
-        error-message: "no shard uploaded a measurements or scan document under ${{ inputs.reports }}; there is nothing to record"
-        upload-reports: "false"
+    # The shared fold is a script reached through `github.action_path`, never a
+    # nested `uses:`: a composite-action reference carries its own ref, which
+    # GitHub resolves independently of the ref a consumer pinned this action to.
+    # `${ACTION_PATH}` is this directory inside the checkout that resolved this
+    # action, so the script is always the consumer's own ref.
+    #
+    # Every value reaches the script through env. Interpolating `${{ }}` into a
+    # run body is a script-injection vector.
+    - shell: bash
+      env:
+        ACTION_PATH: ${{ github.action_path }}
+        DIR: ${{ inputs.dir }}
+        REPORTS: ${{ inputs.reports }}
+        DOC_NAMES: measurements.json scan.json
+        COPY_COMPONENTS: "false"
+        COMMAND: test record
+        EXTRA_ARGS: --branch ${{ inputs.branch }}
+        ERROR_MESSAGE: "no shard uploaded a measurements or scan document under ${{ inputs.reports }}; there is nothing to record"
+      run: bash "${ACTION_PATH}/../.github/actions/fold/fold.sh"
