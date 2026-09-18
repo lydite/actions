@@ -1,26 +1,28 @@
 ---
-about: .github/actions/fold/action.yml, merge/action.yml, record/action.yml, mutation-merge/action.yml
-saw: a628bb5 (fix: the fold is repo-qualified, and mutation resolves a stacked base)
+about: .github/actions/fold/fold.sh, merge/action.yml, record/action.yml, mutation-merge/action.yml
+saw: ef4439e (fix: the fold is a script, so a consumer's pin is the only ref that runs)
 ---
 
-A relative `uses: ./path` inside a **composite action's own steps** resolves against the
-*consuming repository's* checked-out workspace at runtime, not against the repository that
-defines the composite action. This is a different rule from a relative `uses:` in a *workflow*
-file (which this repo's own `lydite.yml` header already documents) — the composite-action case
-is easy to miss because it only breaks when an external consumer runs the action, never when
-this repository's own CI checks the action.yml files structurally (`gt repo check`, the
-manifest-check glob, `actionlint` on bare `action.yml` files all pass regardless).
+No form of `uses:` — relative or repo-qualified — is a safe way for one composite action in
+this repository to reach another. A relative `uses: ./path` inside a composite action's own
+steps resolves against the *consuming repository's* checked-out workspace at runtime, not
+against the repository that defines the composite action, so it breaks immediately for every
+external consumer. A repo-qualified reference (`uses: lydite/actions/.github/actions/fold@v1`)
+fixes that but introduces a second problem: GitHub resolves that nested ref independently of
+whatever ref the consumer pinned the *outer* action to, so a consumer pinning `merge@<sha>` for
+supply-chain safety would still run whatever `v1` currently points to when the fold step runs,
+with that job's token in scope — the SHA pin fixes nothing.
 
-`merge/action.yml`, `record/action.yml` and `mutation-merge/action.yml` all called the shared
-`.github/actions/fold` composite action via `uses: ./.github/actions/fold` when it was first
-extracted. Every local check (YAML parse, `actionlint`, `gt repo check`, a hand-built
-shellcheck/behavioral smoke test) passed, because none of them simulate a real external
-consumer's checkout. Only a code-review pass (`agtk code-review`, `security` reviewer, RED,
-corroborated by two independent runs) caught that a consumer calling
-`lydite/actions/merge@v1` has no `.github/actions/fold/action.yml` anywhere in their own tree,
-so the step fails immediately for everyone outside this repository.
+Both failure modes are easy to miss locally: YAML parsing, `actionlint`, `gt repo check`, and a
+hand-built shellcheck/behavioral smoke test all pass regardless, because none of them simulate
+an external consumer's checkout or a pinned-vs-floating ref mismatch. Both were only caught by
+a posted `agtk code-review` pass on the pull request (`security`, RED then AMBER, each
+corroborated by an independent run) — one per push, since fixing the first surfaced the second.
 
-The fix, and the pattern any future internal composite-action-to-composite-action reference in
-this repository must follow: repo-qualify and pin it exactly like every other cross-action
-reference here, e.g. `uses: lydite/actions/.github/actions/fold@v1` — never a relative path,
-even for an action private to this repository.
+The shape that survived: shared logic between this repository's own composite actions lives as
+a plain script under `.github/actions/`, invoked via `${{ github.action_path }}` from each
+caller's own `run:` step (with the path passed through `env:`, never spliced into the script
+body) — never through any `uses:` to another action in this repository, however it's pinned.
+`github.action_path` is the caller's own directory inside whatever checkout GitHub already
+fetched to resolve *that* action, so the sibling script is always the exact ref the consumer
+named.
