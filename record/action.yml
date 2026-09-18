@@ -33,6 +33,14 @@
 # `record` folds the report directories itself, because it runs in a job
 # `lydite/actions/merge` does not precede.
 #
+# Quality history is per-branch, and the branch is an input rather than
+# something read from the run. An entry lands under the branch it was measured
+# on and gates every later change on that branch; `record` verifies no number,
+# so it has nothing to infer that key from, and a default lands one branch's
+# numbers under another branch's key — silently, which is the failure this
+# action's tree check exists to rule out. The caller says which branch its run
+# belongs to.
+#
 # It needs `fetch-depth: 0`: the baseline lives on a branch this reads and
 # writes, and the tree the candidate names has to resolve.
 name: lydite test record
@@ -49,50 +57,41 @@ inputs:
       `actions/download-artifact` with a `lydite-shard-*` pattern produces
     required: false
     default: shards
+  branch:
+    description: >
+      the branch this baseline is being recorded for; a consumer calling this
+      action directly must be explicit
+    required: true
 
 runs:
   using: composite
   steps:
+    # The fold itself is shared; what is this action's is that the documents
+    # are a measurement or a scan, that nothing here is published — so no
+    # component subdirectory is copied and no artifact is uploaded — and the
+    # branch the entry lands under.
+    #
+    # The shared fold is a script reached through `github.action_path`, never a
+    # nested `uses:`: a composite-action reference carries its own ref, which
+    # GitHub resolves independently of the ref a consumer pinned this action to.
+    # `${ACTION_PATH}` is this directory inside the checkout that resolved this
+    # action, so the script is always the consumer's own ref.
+    #
     # Every value reaches the script through env. Interpolating `${{ }}` into a
     # run body is a script-injection vector.
+    #
+    # The branch travels in `BRANCH` rather than in `EXTRA_ARGS`, which the
+    # script word-splits: a consumer calling this action directly supplies that
+    # input, and a space in it would otherwise become a second argument of its
+    # choosing to a command running with `contents: write`.
     - shell: bash
       env:
+        ACTION_PATH: ${{ github.action_path }}
         DIR: ${{ inputs.dir }}
         REPORTS: ${{ inputs.reports }}
-      run: |
-        set -euo pipefail
-        shopt -s nullglob
-
-        # `record` needs the document, so the document is what is looked for.
-        # actions/download-artifact gives an artifact its own subdirectory only
-        # when the pattern matched more than one, and extracts a lone match
-        # straight into `path` — so a run with one shard, or one scan job,
-        # leaves its document directly under ${REPORTS}, where a `*/` glob
-        # never looks. That glob then offers the shard's own per-component log
-        # directory instead, and the fold records no measurement while staying
-        # green saying so. Depth 2 reaches both shapes and stops above the
-        # per-component directories, which hold logs and coverage reports
-        # rather than either document.
-        #
-        # `merge-multiple: true` on the download that produced ${REPORTS} is
-        # not the fix: it puts every shard's `measurements.json` at one path,
-        # and the per-shard separation it collapses is what completeness is
-        # re-checked from here.
-        args=()
-        dirs=()
-        while IFS= read -r dir; do
-          args+=(--reports "${dir}")
-          dirs+=("${dir}")
-        done < <(find "${REPORTS%/}" -maxdepth 2 \
-                   \( -name measurements.json -o -name scan.json \) \
-                   -exec dirname {} \; | sort -u)
-        if [ "${#dirs[@]}" -eq 0 ]; then
-          echo "::error::no shard uploaded a measurements or scan document under ${REPORTS}; there is nothing to record"
-          exit 1
-        fi
-
-        # Named out loud, because the defect this guards against is a fold
-        # reading a directory nobody meant it to and saying nothing.
-        printf 'folding %s\n' "${dirs[@]}"
-
-        lydite test record --dir "${DIR}" "${args[@]}"
+        DOC_NAMES: measurements.json scan.json
+        COPY_COMPONENTS: "false"
+        COMMAND: test record
+        BRANCH: ${{ inputs.branch }}
+        ERROR_MESSAGE: "no shard uploaded a measurements or scan document under ${{ inputs.reports }}; there is nothing to record"
+      run: bash "${ACTION_PATH}/../.github/actions/fold/fold.sh"

@@ -46,6 +46,16 @@ inputs:
     description: which job's reports these are; becomes the artifact suffix
     required: false
     default: scan
+  artifact-prefix:
+    description: >
+      what the artifact is called before the suffix. `publish` reads
+      `lydite-reports-*` and renders each as a section of the comment, which is
+      what a pull request's scan wants. A baseline's scan is an input to
+      `lydite/actions/record` instead, so it passes `lydite-scan`: `record`
+      downloads it by a pattern of its own, and an artifact matching either the
+      shards' or the comment's would be folded as something it is not.
+    required: false
+    default: lydite-reports
 
 runs:
   using: composite
@@ -92,7 +102,7 @@ runs:
     - if: ${{ always() && steps.reports.outputs.path != '' }}
       uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
       with:
-        name: lydite-reports-${{ inputs.artifact-name }}
+        name: ${{ inputs.artifact-prefix }}-${{ inputs.artifact-name }}
         path: ${{ steps.reports.outputs.path }}
         retention-days: 7
         # The directory disowns itself with a .gitignore, and an artifact that

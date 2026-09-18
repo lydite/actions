@@ -1,0 +1,148 @@
+# Mutates the components this job is responsible for, and uploads the reports.
+#
+# It assumes lydite is already on PATH — `lydite/actions/setup` puts it there.
+#
+# Two inputs decide what this actually runs, and neither is inferred:
+#
+#   - `affected` runs only the components a change could have broken. A
+#     component the change does not touch costs nothing — no baseline suite, no
+#     compose stack — because half of what bounds a mutant is knowable from the
+#     diff alone.
+#   - `component` says which components this job is *responsible for*, which is
+#     what lets a matrix of jobs each hold one shard.
+#
+# lydite infers neither. Every signal for "is this a pull request" is unreliable
+# where it runs — a detached HEAD, a shallow clone, a fork with no upstream —
+# and the workflow already knows the event; and no run can guess which slice of
+# a matrix it is.
+#
+# `component` and `affected` compose rather than substituting for each other:
+# `component` narrows what this job answers about, `affected` narrows which of
+# those actually run, and a component in the slice that selection skipped is
+# still reported — one row. A job reports nothing at all about a component
+# outside its slice, which is what lets `lydite/actions/mutation-merge` decide
+# completeness from the declaration and the documents alone.
+#
+# The run always streams. A mutation run prints nothing for as long as it takes:
+# every mutant's line goes to the component's log, and that log reaches a reader
+# through the artifact this action uploads on its way out. A job that is killed
+# never gets there, so the whole run is lost and nothing says how far it had
+# come — which is the case `--stream` exists for. A suite's own log stays
+# captured under `lydite/actions/test`, where thousands of passing lines would
+# bury the one component that failed.
+#
+# Mutation is diff-scoped always: mutants come from the change against the
+# merge-base, so the caller's checkout has to be `fetch-depth: 0`. lydite
+# refuses rather than mutating the repository.
+name: lydite mutation
+description: Mutate each component under lydite and upload the reports
+
+inputs:
+  dir:
+    description: the scan root, relative to the workspace
+    required: false
+    default: "."
+  affected:
+    description: run only the components this change could have broken
+    required: false
+    default: "false"
+  component:
+    description: >
+      comma-separated components this job is responsible for; empty makes it
+      responsible for every declared one. A shard matrix passes its own slice.
+    required: false
+    default: ""
+  base-branch:
+    description: >
+      the branch a merge-base is resolved against. Pass `github.base_ref` on a
+      pull request; empty lets lydite discover the default branch.
+    required: false
+    default: ""
+  concurrency:
+    description: how many components may run at once; empty keeps lydite's own default
+    required: false
+    default: ""
+  cache:
+    description: >
+      cache ~/.cache/lydite, where every pinned runner, scanner and language
+      toolchain lydite installs lands
+    required: false
+    default: "true"
+  upload-reports:
+    description: upload .lydite-reports as an artifact for a later `publish`
+    required: false
+    default: "true"
+  artifact-name:
+    description: which job's reports these are; becomes the artifact suffix
+    required: false
+    default: mutation
+  artifact-prefix:
+    description: >
+      what the artifact is called before the suffix. A shard's document is an
+      input to `lydite/actions/mutation-merge`, not a section of the comment, so
+      a matrix passes `lydite-mutation-shard`: `publish` reads
+      `lydite-reports-*`, and would otherwise render one `mutation` section per
+      shard, each answering about part of the repository under one heading.
+    required: false
+    default: lydite-reports
+
+runs:
+  using: composite
+  steps:
+    # Keyed on the pin manifests, so a Dependabot bump misses and installs what
+    # it just pinned. The globs are lydite's own layout for a consumer that
+    # vendors nothing, plus whatever the repository's own declaration names.
+    - if: ${{ inputs.cache == 'true' }}
+      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ~/.cache/lydite
+        key: lydite-${{ runner.os }}-${{ hashFiles('**/.lydite/components.yml', '**/rust-toolchain.toml', '**/package-lock.json', '**/go.sum') }}
+        restore-keys: lydite-${{ runner.os }}-
+
+    # Every value reaches the script through env. Interpolating `${{ }}` into a
+    # run body is a script-injection vector.
+    - shell: bash
+      env:
+        DIR: ${{ inputs.dir }}
+        AFFECTED: ${{ inputs.affected }}
+        COMPONENT: ${{ inputs.component }}
+        BASE_BRANCH: ${{ inputs.base-branch }}
+        CONCURRENCY: ${{ inputs.concurrency }}
+      run: |
+        set -euo pipefail
+        args=(mutation --dir "${DIR}")
+        if [ "${AFFECTED}" = "true" ]; then
+          args+=(--affected)
+        fi
+        if [ -n "${COMPONENT}" ]; then
+          args+=(--component "${COMPONENT}")
+        fi
+        if [ -n "${BASE_BRANCH}" ]; then
+          args+=(--base-branch "${BASE_BRANCH}")
+        fi
+        if [ -n "${CONCURRENCY}" ]; then
+          args+=(--concurrency "${CONCURRENCY}")
+        fi
+        args+=(--stream)
+        lydite "${args[@]}"
+
+    - id: reports
+      if: ${{ always() && inputs.upload-reports == 'true' }}
+      shell: bash
+      env:
+        DIR: ${{ inputs.dir }}
+      run: |
+        path="${DIR%/}/.lydite-reports"
+        if [ -d "${path}" ]; then
+          echo "path=${path}" >> "${GITHUB_OUTPUT}"
+        else
+          echo "no ${path}: this job wrote no report" >&2
+        fi
+
+    - if: ${{ always() && steps.reports.outputs.path != '' }}
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      with:
+        name: ${{ inputs.artifact-prefix }}-${{ inputs.artifact-name }}
+        path: ${{ steps.reports.outputs.path }}
+        retention-days: 7
+        include-hidden-files: true

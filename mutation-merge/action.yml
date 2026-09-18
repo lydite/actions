@@ -1,26 +1,23 @@
-# Folds a shard matrix's documents back into one, and uploads the result as the
-# `test` section of the comment.
+# Folds a shard matrix's mutation documents back into one, and uploads the
+# result as the `mutation` section of the comment.
 #
 # It assumes lydite is already on PATH — `lydite/actions/setup` puts it there.
 #
-# This is where completeness is decided, and it is the reason the shards may
-# each report only what they own. Every declared component takes exactly one row
-# across the matrix, so a component with no row is a shard whose job died and a
-# component with two is two jobs running the same work — both failures, and
-# neither is `unmeasured`, which does not vote and would publish a passing
-# verdict over a repository half of which was never tested.
+# This is the completeness check, and it is the reason the shards may each report
+# only what they own. Every declared component takes exactly one row across the
+# matrix, so a component with no row is a shard whose job died and a component
+# with two is two jobs running the same work — both failures, and neither is
+# `unmeasured`, which does not vote and would publish a passing verdict over a
+# repository half of which was never mutated.
 #
-# It is also the only thing that computes `coverage(repo)` and `patch(repo)`.
-# Both sum every component's counts, so a shard holding two of four would answer
-# about its own two under a label about the repository. The shards' measurements
-# carry each component's counts, its patch part and the baseline entry it was
-# gated against, so the composition touches no network, resolves no merge-base
-# and runs nothing from the repository.
+# Unlike the test fold it computes no figure over the repository: there is none
+# to compute, since survived == 0 for every component is survived == 0 for the
+# repository. What it adds to the shards' rows is the summary row.
 #
 # It needs a checkout, because completeness is a question about the declaration
 # and the declaration is read from the tree.
-name: lydite test merge
-description: Fold every shard's lydite test report into one, and upload it for a later publish
+name: lydite mutation merge
+description: Fold every shard's lydite mutation report into one, and upload it for a later publish
 
 inputs:
   dir:
@@ -30,7 +27,8 @@ inputs:
   reports:
     description: >
       directory holding one subdirectory per shard's uploaded reports, as
-      `actions/download-artifact` with a `lydite-shard-*` pattern produces
+      `actions/download-artifact` with a `lydite-mutation-shard-*` pattern
+      produces
     required: false
     default: shards
   upload-reports:
@@ -40,7 +38,7 @@ inputs:
   artifact-name:
     description: which section of the comment these reports become
     required: false
-    default: test
+    default: mutation
 
 runs:
   using: composite
@@ -62,9 +60,9 @@ runs:
         ACTION_PATH: ${{ github.action_path }}
         DIR: ${{ inputs.dir }}
         REPORTS: ${{ inputs.reports }}
-        DOC_NAMES: measurements.json test.json
+        DOC_NAMES: mutation.json
         COPY_COMPONENTS: "true"
-        COMMAND: test merge
+        COMMAND: mutation merge
         ERROR_MESSAGE: "no shard uploaded a report directory under ${{ inputs.reports }}; there is nothing to fold"
       run: bash "${ACTION_PATH}/../.github/actions/fold/fold.sh"
 
