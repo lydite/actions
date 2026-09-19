@@ -116,6 +116,17 @@ fail on this branch. A consumer calling `record@v1` directly rather than through
 `lydite-baseline.yml` must pass its `branch` input explicitly — `record` verifies no number, so
 it has nothing to infer that key from, and no default is safe to guess.
 
+**And a mutate matrix, on the same shards `measure` runs on.** A mutant exists only on a line the
+change touched, and on the default branch HEAD is its own merge-base — so this matrix passes
+`base-sha: HEAD~1`, the merge commit's own diff against its first parent, which is the same
+contribution whether the merge landed as a squash or as a true two-parent commit. It also passes
+`no-gate: true`: after the merge a survivor is history rather than a verdict, since the branch that
+could fix it is gone, so the measurement is recorded without voting on the step's exit code, while
+a component that could not be mutated at all still fails the job. `record` folds those documents in
+beside the measurements and the finding count, and records nothing for a component absent from them
+— untouched by the merge, declared `mutation: false`, or held by a shard the 60-minute ceiling cut
+short.
+
 ## Or the pieces
 
 Every action assumes lydite is already on `PATH`, so a workflow running more than one
