@@ -7,6 +7,7 @@
 #   scan ──────────────────────────┤
 #   plan ─┬─► test (matrix) ───────► merge
 #         └─► mutation (matrix) ───► mutation-merge
+#   mutation-declined ─────────────┤   instead of both, when mutation: false
 #                                  └─► publish   needs all, if: always()
 #
 #   jobs:
@@ -42,9 +43,16 @@
 # overlapping directories, which is the same question whichever command
 # consumes it. It does not run after — mutation and the coverage gate share a
 # checkout and not a compilation, so a phase inside `test` would make each of
-# those jobs serially longer by the most expensive thing lydite runs. There is
-# no input to decline it: a comment with no mutation section is a comment that
-# reads as a repository whose mutants all died.
+# those jobs serially longer by the most expensive thing lydite runs.
+#
+# `mutation: false` declines it, and declining is not the same as omitting it: a
+# comment with no mutation section reads as a repository whose mutants all died.
+# So `mutation-declined` runs instead of the matrix and its fold, and writes the
+# one document that says so under the same artifact name the fold would have
+# uploaded. It needs no `plan`, because `--declined` returns before a component
+# is loaded, and it must not reach the fold, whose completeness check would read
+# a document carrying no component row as every declared component's shard
+# having died.
 #
 # Nothing records a coverage baseline here, and that is the design rather than
 # an omission. Recording is a push to the `lydite` branch, and this workflow's
@@ -78,6 +86,11 @@ on:
         default: true
       affected:
         description: run only the components this change could have broken
+        type: boolean
+        required: false
+        default: true
+      mutation:
+        description: mutate this change; false says so in the comment rather than omitting the section
         type: boolean
         required: false
         default: true
@@ -228,6 +241,7 @@ jobs:
   mutation:
     name: mutation (${{ matrix.shard.name }})
     needs: plan
+    if: ${{ inputs.mutation }}
     runs-on: ubuntu-latest
     # Longer than the test matrix on purpose: a mutant is a suite run, and a
     # component's budget is its mutant count times its own suite. Nothing caps
@@ -270,6 +284,44 @@ jobs:
           artifact-name: ${{ matrix.shard.name }}
           artifact-prefix: lydite-mutation-shard
 
+  # The declined half of the input, and the whole of what it does is write the
+  # document saying so. No `needs`, no history and no container runtime:
+  # `--declined` returns before a component is loaded, so there is no shard plan
+  # to wait for and nothing to diff against a merge-base. The artifact is named
+  # exactly as `mutation-merge`'s fold names its own, so `publish` reads either
+  # run through the same `lydite-reports-*` pattern.
+  mutation-declined:
+    name: mutation declined
+    if: ${{ !inputs.mutation }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: lydite/actions/setup@v1
+        with:
+          version: ${{ inputs.lydite-version }}
+
+      # Every value reaches the shell through env. Interpolating `${{ }}` into a
+      # run body is a script-injection vector.
+      - id: reports
+        shell: bash
+        env:
+          DIR: ${{ inputs.dir }}
+        run: |
+          set -euo pipefail
+          lydite mutation --declined --dir "${DIR}"
+          echo "path=${DIR%/}/.lydite-reports" >> "${GITHUB_OUTPUT}"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: lydite-reports-mutation
+          path: ${{ steps.reports.outputs.path }}
+          retention-days: 7
+          include-hidden-files: true
+
   merge:
     name: merge
     needs: [plan, test]
@@ -308,8 +360,9 @@ jobs:
     needs: [plan, mutation]
     # Whatever the shards did. A shard that failed is exactly the run whose fold
     # a reader wants, and a shard that died is what the fold exists to report
-    # rather than to inherit as silence.
-    if: always()
+    # rather than to inherit as silence. A declined run has no shards at all,
+    # and folding none of them would report every declared component as dead.
+    if: ${{ always() && inputs.mutation }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -333,7 +386,7 @@ jobs:
 
   publish:
     name: publish
-    needs: [referral, scan, merge, mutation-merge]
+    needs: [referral, scan, merge, mutation-merge, mutation-declined]
     # Runs whatever the others did. A comment that only appears when everything
     # passed is a comment nobody needs: the run that failed is the one whose
     # reader wants to know why.
