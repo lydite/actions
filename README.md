@@ -26,6 +26,7 @@ referral ──────────────────────┐  
 scan ──────────────────────────┤
 plan ─┬─► test (matrix) ───────► merge
       └─► mutation (matrix) ───► mutation-merge
+mutation-declined ─────────────┤   instead of both, when mutation: false
                                └─► publish   needs all, if: always()
 ```
 
@@ -33,7 +34,7 @@ That runs the referral, the scan, the gated suites and the mutation matrix in pa
 renders **one standing comment** from all four. It has to be one run: the comment is assembled
 from every job's reports, so they have to be artifacts of the same run.
 
-Inputs: `dir`, `lydite-version`, `gate-coverage`, `affected`, `relay`. Secret:
+Inputs: `dir`, `lydite-version`, `gate-coverage`, `affected`, `mutation`, `relay`. Secret:
 `semgrep-token`.
 
 **The suites are sharded, and there is nothing to configure.** A `plan` job groups the declared
@@ -54,17 +55,20 @@ half of which was never tested. It is also the only thing that can compute `cove
 `patch(repo)`: both sum every component's counts, and a shard holding two of four would answer
 about its own two under a label about the repository.
 
-**Mutation runs beside the test matrix, on the same shards, and there is no way to decline it.**
-It reuses `plan`'s output verbatim rather than running as a phase inside `test`, since mutation
-and the coverage gate share a checkout and not a compilation, and a `mutation-merge` job folds
-the shards' documents the same way `merge` does — a component with no row is a shard whose job
-died, and there is no repository-wide figure to compute beyond that, since survived == 0 for
-every component is survived == 0 for the repository. A mutant is a full suite run, so a
-component's budget is its mutant count times its own suite, and nothing inside lydite caps that:
-the mutation job's timeout is 60 minutes, twice the test matrix's 30, and lydite/lydite#97
-measured a 1,276-line change at 54 minutes against it — a large change can run close to that
-limit. Every pull request gets a mutation section in the comment; there is no input that skips
-this job.
+**Mutation runs beside the test matrix, on the same shards.** It reuses `plan`'s output verbatim
+rather than running as a phase inside `test`, since mutation and the coverage gate share a
+checkout and not a compilation, and a `mutation-merge` job folds the shards' documents the same
+way `merge` does — a component with no row is a shard whose job died, and there is no
+repository-wide figure to compute beyond that, since survived == 0 for every component is
+survived == 0 for the repository. A mutant is a full suite run, so a component's budget is its
+mutant count times its own suite, and nothing inside lydite caps that: the mutation job's timeout
+is 60 minutes, twice the test matrix's 30, and lydite/lydite#97 measured a 1,276-line change at
+54 minutes against it — a large change can run close to that limit.
+
+`mutation: false` declines the whole matrix in favour of a single `mutation-declined` job, which
+costs no mutants run and no coverage-of-mutants signal for that run. The comment still gets a
+mutation section — rendered as declined, not silently missing, since an absent section would
+read as a repository whose mutants all died — see lydite/lydite#171 for what that looks like.
 
 ## Recording the baseline, after the merge
 
