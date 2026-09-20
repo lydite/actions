@@ -89,9 +89,9 @@ runs:
         ACTION_PATH: ${{ github.action_path }}
         DIR: ${{ inputs.dir }}
         REPORTS: ${{ inputs.reports }}
-        DOC_NAMES: measurements.json scan.json
+        DOC_NAMES: measurements.json scan.json mutants.json
         COPY_COMPONENTS: "false"
         COMMAND: test record
         BRANCH: ${{ inputs.branch }}
-        ERROR_MESSAGE: "no shard uploaded a measurements or scan document under ${{ inputs.reports }}; there is nothing to record"
+        ERROR_MESSAGE: "no shard uploaded a measurements, scan, or mutants document under ${{ inputs.reports }}; there is nothing to record"
       run: bash "${ACTION_PATH}/../.github/actions/fold/fold.sh"

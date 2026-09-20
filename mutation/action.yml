@@ -34,6 +34,14 @@
 # Mutation is diff-scoped always: mutants come from the change against the
 # merge-base, so the caller's checkout has to be `fetch-depth: 0`. lydite
 # refuses rather than mutating the repository.
+#
+# `base-sha` names the other end of that diff outright, for a run that has no
+# merge-base to resolve: after a merge HEAD is its own merge-base, and `HEAD~1`
+# is the merge commit's own contribution. `no-gate` belongs with it — there a
+# survivor is history rather than a verdict, because the branch that could fix
+# it is gone, so a completed measurement is recorded without voting on the
+# step's exit code while a not-runnable component or an unresolvable base still
+# fails the job. A pull request passes neither: its gate is the point.
 name: lydite mutation
 description: Mutate each component under lydite and upload the reports
 
@@ -58,6 +66,19 @@ inputs:
       pull request; empty lets lydite discover the default branch.
     required: false
     default: ""
+  base-sha:
+    description: >
+      a revision the diff is taken against instead of a merge-base, resolved
+      with `git rev-parse --verify` and never fetched. A post-merge run passes
+      `HEAD~1`; empty leaves lydite resolving a merge-base.
+    required: false
+    default: ""
+  no-gate:
+    description: >
+      let a completed measurement finish without a survivor voting on the step's
+      exit code. A post-merge run passes `true`; a pull request never does.
+    required: false
+    default: "false"
   concurrency:
     description: how many components may run at once; empty keeps lydite's own default
     required: false
@@ -107,6 +128,8 @@ runs:
         AFFECTED: ${{ inputs.affected }}
         COMPONENT: ${{ inputs.component }}
         BASE_BRANCH: ${{ inputs.base-branch }}
+        BASE_SHA: ${{ inputs.base-sha }}
+        NO_GATE: ${{ inputs.no-gate }}
         CONCURRENCY: ${{ inputs.concurrency }}
       run: |
         set -euo pipefail
@@ -120,10 +143,16 @@ runs:
         if [ -n "${BASE_BRANCH}" ]; then
           args+=(--base-branch "${BASE_BRANCH}")
         fi
+        if [ -n "${BASE_SHA}" ]; then
+          args+=(--base-sha "${BASE_SHA}")
+        fi
         if [ -n "${CONCURRENCY}" ]; then
           args+=(--concurrency "${CONCURRENCY}")
         fi
         args+=(--stream)
+        if [ "${NO_GATE}" = "true" ]; then
+          args+=(--no-gate)
+        fi
         lydite "${args[@]}"
 
     - id: reports
