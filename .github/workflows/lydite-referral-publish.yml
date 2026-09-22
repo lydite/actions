@@ -1,0 +1,210 @@
+# Decides and publishes the referral verdict from a comparison another job
+# already made, holding the one credential that can write a commit status and
+# running none of the change's own code.
+#
+# This is a separate reusable workflow from `lydite.yml`'s own `referral` job
+# on purpose: an opted-in Rust component's api_surface comparison builds and
+# executes the head tree's own build.rs and proc-macros, so the job that ran
+# it must hold no credential worth forging a status with — and the job that
+# holds `statuses: write` must never be the one that ran a change's own code.
+# A consumer wanting that split runs its own comparison job with no token,
+# uploads its result as the `referral-surfaces` artifact, and calls this
+# workflow beside it.
+#
+# lydite's own `job_workflow_ref` is what lets `pr-relay` tell this job apart
+# from one that runs the pull request's own code, which is why this file
+# carries exactly this one job and nothing else — see
+# lydite/lydite's docs/adr/0051-lydite-is-a-plain-consumer-of-its-own-relay.md.
+#
+#   - No relay configured, or 409 — the app is not installed on this
+#     repository. Both fall back silently to posting with the workflow's own
+#     token; the second is the ordinary state of every repository that has not
+#     opted in.
+#   - A 5xx, or curl's `000` for a relay it could not reach at all. Falls
+#     back, under a `::warning::`: a lydite outage must not fail a consumer's
+#     pull request, and must not pass unremarked either.
+#   - Anything else — 401 for a token the relay would not verify, 400 for a
+#     payload it would not read, 403 for a run whose ref or sha does not match
+#     this pull request. Each is deterministic, so the next run answers the
+#     same. The step fails rather than falling back.
+#
+# Nothing here interpolates an expression into a `run:` body. Every value
+# arrives through `env:` and is referenced as a shell variable.
+name: lydite referral publish
+
+on:
+  workflow_call:
+    inputs:
+      dir:
+        description: root directory whose .lydite/exemptions.yml applies
+        type: string
+        required: false
+        default: "."
+      lydite-version:
+        description: which lydite release to run; `latest` resolves the newest
+        type: string
+        required: false
+        default: latest
+      relay:
+        description: >
+          the status relay's origin, so the verdict is published as lydite and
+          no job holds a credential that can write. Empty posts as
+          github-actions[bot], which is a supported path and not a stopgap.
+        type: string
+        required: false
+        default: ""
+
+jobs:
+  referral-publish:
+    name: referral publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      # The verdict is the record a clearance acts on.
+      statuses: write
+      # Mints the Actions OIDC token the relay authenticates. It is not a
+      # credential and grants nothing by itself.
+      id-token: write
+    steps:
+      # Read, never executed. The comparison that runs a component's own
+      # build.rs or proc-macro already happened in the job that produced
+      # referral-surfaces, which holds no credential; this checkout is only
+      # ever read for the diff and the declared exemptions, in a job that
+      # holds statuses: write, so it must not hand the checked-out tree a
+      # credential of its own either.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The verdict is computed from <merge-base>..HEAD, so the history
+          # reaching that merge-base has to be present. A shallow checkout
+          # resolves no merge-base and the run fails rather than deciding from
+          # a diff that describes something else.
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: lydite/actions/setup@v1
+        with:
+          version: ${{ inputs.lydite-version }}
+
+      # Best-effort: the split this workflow's header describes is opt-in, and
+      # most callers have no paired comparison job uploading this artifact at
+      # all — the ordinary case is that nothing by this name exists.
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        continue-on-error: true
+        with:
+          name: referral-surfaces
+          path: ${{ runner.temp }}
+
+      # Best-effort: a scan job that has not run yet, or failed, uploads
+      # nothing. Either way this job still owes a verdict — it just decides
+      # the version-bump exemption's licence/SCA condition without evidence,
+      # which is exactly what a missing --reports argument does below.
+      - name: download the scan report
+        continue-on-error: true
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: lydite-reports-scan
+          path: scan-report
+
+      # review exits 2 on a referral and 1 on the isolation gate, and both are
+      # answers rather than malfunctions — the verdict is carried by the
+      # document this step renders, so the step must not fail the job over
+      # one. Anything above 2 is lydite failing to reach an answer, which must
+      # still fail the job and skip the steps that publish nothing.
+      #
+      # The exit code is captured with `|| verdict=$?` rather than read from
+      # `$?` on the next line, because the runner invokes this with `bash -e`:
+      # a bare command exiting non-zero ends the step before any line after it
+      # runs.
+      - name: render the referral verdict
+        shell: bash
+        env:
+          DIR: ${{ inputs.dir }}
+        run: |
+          set -euo pipefail
+          verdict=0
+          args=(review --dir "${DIR}" \
+            --publish --status-out "${RUNNER_TEMP}/lydite-status.json")
+          if [ -f "${RUNNER_TEMP}/referral-surfaces.json" ]; then
+            args+=(--surfaces "${RUNNER_TEMP}/referral-surfaces.json")
+          fi
+          # No --surfaces here (the paired comparison job above uploaded
+          # nothing) still refuses to run: --publish sets guardCredential, so
+          # lydite computes surfaces itself here without executing any opted-
+          # in Rust component's own build.rs or proc-macro, reporting each as
+          # uncomputable instead — the same protection lydite.yml's own
+          # single-job referral run relies on for a generic consumer with no
+          # separate compare job.
+          if [ -f scan-report/scan.json ]; then
+            args+=(--reports scan-report)
+          fi
+          lydite "${args[@]}" || verdict=$?
+          if [ "${verdict}" -gt 2 ]; then
+            exit "${verdict}"
+          fi
+
+      - id: relay
+        if: inputs.relay != ''
+        shell: bash
+        env:
+          STATUS_FILE: ${{ runner.temp }}/lydite-status.json
+          RELAY: ${{ inputs.relay }}
+        run: |
+          set -euo pipefail
+
+          # The audience is the relay's own origin, so a token minted here
+          # cannot be replayed against another service — and the relay
+          # refuses one whose audience is not its own.
+          token=$(curl -fsS \
+            -H "Authorization: Bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=${RELAY}" | jq -r '.value')
+
+          # The rendered document already carries exactly the fields the
+          # relay's /status route reads — state, context, description, sha,
+          # pull_request — so it is posted as-is rather than reassembled.
+          status=$(curl -sS -o "${RUNNER_TEMP}/relay-out.json" -w '%{http_code}' \
+            -X POST "${RELAY}/status" \
+            -H "Authorization: Bearer ${token}" \
+            -H 'content-type: application/json' \
+            --data-binary "@${STATUS_FILE}") || status=000
+
+          if [ "${status}" = "200" ]; then
+            echo "posted=true" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+          case "${status}" in
+            409)
+              echo "posted=false" >> "${GITHUB_OUTPUT}"
+              echo "the relay answered ${status}; falling back to this workflow's token" >&2
+              ;;
+            000|5??)
+              echo "posted=false" >> "${GITHUB_OUTPUT}"
+              echo "::warning::the relay answered ${status}; falling back to this workflow's token" >&2
+              ;;
+            *)
+              # No `posted` output: the step's own failure is the whole of
+              # what this branch says, and it skips the fallback step below
+              # rather than choosing for it.
+              echo "::error::the relay answered ${status}; this is a configuration problem, not an outage, so it fails the step rather than falling back" >&2
+              cat "${RUNNER_TEMP}/relay-out.json" >&2 || true
+              exit 1
+              ;;
+          esac
+          cat "${RUNNER_TEMP}/relay-out.json" >&2 || true
+
+      - if: steps.relay.outputs.posted != 'true'
+        shell: bash
+        env:
+          STATUS_FILE: ${{ runner.temp }}/lydite-status.json
+          REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          sha=$(jq -r '.sha' "${STATUS_FILE}")
+          gh api -X POST "repos/${REPO}/statuses/${sha}" \
+            -f "state=$(jq -r '.state' "${STATUS_FILE}")" \
+            -f "context=$(jq -r '.context' "${STATUS_FILE}")" \
+            -f "description=$(jq -r '.description' "${STATUS_FILE}")" \
+            -f "target_url=$(jq -r '.target_url // \"\"' "${STATUS_FILE}")" \
+            --silent
+          echo "posted the status to ${sha}"
