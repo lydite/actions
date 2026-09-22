@@ -86,7 +86,11 @@ jobs:
         with:
           version: ${{ inputs.lydite-version }}
 
+      # Best-effort: the split this workflow's header describes is opt-in, and
+      # most callers have no paired comparison job uploading this artifact at
+      # all — the ordinary case is that nothing by this name exists.
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        continue-on-error: true
         with:
           name: referral-surfaces
           path: ${{ runner.temp }}
@@ -119,8 +123,18 @@ jobs:
         run: |
           set -euo pipefail
           verdict=0
-          args=(review --dir "${DIR}" --surfaces "${RUNNER_TEMP}/referral-surfaces.json" \
+          args=(review --dir "${DIR}" \
             --publish --status-out "${RUNNER_TEMP}/lydite-status.json")
+          if [ -f "${RUNNER_TEMP}/referral-surfaces.json" ]; then
+            args+=(--surfaces "${RUNNER_TEMP}/referral-surfaces.json")
+          fi
+          # No --surfaces here (the paired comparison job above uploaded
+          # nothing) still refuses to run: --publish sets guardCredential, so
+          # lydite computes surfaces itself here without executing any opted-
+          # in Rust component's own build.rs or proc-macro, reporting each as
+          # uncomputable instead — the same protection lydite.yml's own
+          # single-job referral run relies on for a generic consumer with no
+          # separate compare job.
           if [ -f scan-report/scan.json ]; then
             args+=(--reports scan-report)
           fi
