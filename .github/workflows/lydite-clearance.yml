@@ -172,3 +172,35 @@ jobs:
             -f "target_url=$(jq -r '.target_url // \"\"' "${STATUS_FILE}")" \
             --silent
           echo "posted the status to ${sha}"
+
+      # The referral the clearance resolved, posted with this job's own token.
+      # It is never relayed: the relay pairs a job_workflow_ref to exactly one
+      # context and admits a clearance ref to lydite/clearance alone, so a
+      # lydite/referral body from here is a deliberate 403. This runs whether
+      # or not the relay published the clearance record, because the two are
+      # written under different authority.
+      #
+      # A clearance recorded with no referral document beside it means the
+      # lydite running here predates the second document. That fails the step
+      # rather than passing quietly: a gate left pending by a clearance that
+      # reported success is the failure this step exists to prevent.
+      - if: steps.clearance.outputs.rendered == 'true'
+        shell: bash
+        env:
+          STATUS_FILE: ${{ runner.temp }}/lydite-status.referral.json
+          REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if [ ! -f "${STATUS_FILE}" ]; then
+            echo "::error::a clearance was recorded with no referral document beside it — this lydite does not resolve the referral on the render route; upgrade to v0.2.1 or newer" >&2
+            exit 1
+          fi
+          sha=$(jq -r '.sha' "${STATUS_FILE}")
+          gh api -X POST "repos/${REPO}/statuses/${sha}" \
+            -f "state=$(jq -r '.state' "${STATUS_FILE}")" \
+            -f "context=$(jq -r '.context' "${STATUS_FILE}")" \
+            -f "description=$(jq -r '.description' "${STATUS_FILE}")" \
+            -f "target_url=$(jq -r '.target_url // \"\"' "${STATUS_FILE}")" \
+            --silent
+          echo "resolved the referral on ${sha}"
