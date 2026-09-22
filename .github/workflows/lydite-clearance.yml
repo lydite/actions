@@ -1,0 +1,174 @@
+# Answers a lydite command posted on a pull request, and publishes the
+# clearance record under the App's identity where a consumer has opted in.
+#
+# A caller wires this to `issue_comment`, never to `pull_request`: an
+# `issue_comment` run always executes the default branch's own copy of every
+# workflow file, so the deciding logic is never the pull request's to edit.
+# Nothing here checks out the pull request's code, and nothing here may start
+# doing so — this job holds a writing token, and running code from the branch
+# it is deciding about is how that token would be taken. lydite reads the
+# pull request through the platform's API and never executes anything out of
+# the change.
+#
+# `/lydite clear` records a document at --status-out; `/lydite explain` and
+# `/lydite exempt <shape>` only reply to the comment, through the job's own
+# token, and render nothing. The relay step below only runs when a document
+# was rendered, so a comment that clears nothing never reaches it.
+#
+#   - No relay configured, or 409 — the app is not installed on this
+#     repository. Both fall back silently to posting with the workflow's own
+#     token; the second is the ordinary state of every repository that has not
+#     opted in.
+#   - A 5xx, or curl's `000` for a relay it could not reach at all. Falls
+#     back, under a `::warning::`: a lydite outage must not leave a clearance
+#     comment answered with silence, and must not pass unremarked either.
+#   - Anything else — 401 for a token the relay would not verify, 400 for a
+#     payload it would not read, 403 for a run this relay does not admit as a
+#     clearance run. Each is deterministic, so the next run answers the same.
+#     The step fails rather than falling back.
+#
+# Nothing here interpolates an expression into a `run:` body. Every value
+# arrives through `env:` and is referenced as a shell variable.
+name: lydite clearance
+
+on:
+  workflow_call:
+    inputs:
+      dir:
+        description: root directory whose .lydite/exemptions.yml applies
+        type: string
+        required: false
+        default: "."
+      lydite-version:
+        description: which lydite release to run; `latest` resolves the newest
+        type: string
+        required: false
+        default: latest
+      relay:
+        description: >
+          the status relay's origin, so a clearance is published as lydite and
+          no job holds a credential that can write. Empty posts as
+          github-actions[bot], which is a supported path and not a stopgap.
+        type: string
+        required: false
+        default: ""
+
+jobs:
+  clearance:
+    name: clearance
+    # Evaluated before a runner is allocated, so every comment that is not
+    # addressed to lydite — which is nearly all of them — costs nothing at
+    # all rather than costing a short job.
+    if: >-
+      github.event.issue.pull_request &&
+      startsWith(github.event.comment.body, '/lydite')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      # The record a clearance acts on, posted directly when no relay is
+      # configured, or by the fallback step below when the relay could not be
+      # reached.
+      statuses: write
+      # Every reply this command posts — explain, exempt, refuse — as well as
+      # the fallback path for a clear itself.
+      pull-requests: write
+      # Mints the Actions OIDC token the relay authenticates. It is not a
+      # credential and grants nothing by itself.
+      id-token: write
+    steps:
+      # The default branch, which is what an issue_comment event checks out
+      # and what this job must run. Shallow on purpose: the decision is made
+      # from the platform's API rather than from a diff, so no history is
+      # needed.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: lydite/actions/setup@v1
+        with:
+          version: ${{ inputs.lydite-version }}
+
+      # The event payload is read from GITHUB_EVENT_PATH, which the runner
+      # sets for every job — not a ${{ }} expression, so this is not the
+      # interpolation a run: body must never carry.
+      #
+      # --status-out only ever writes a document for /lydite clear: explain,
+      # exempt and refuse reply to the comment directly, through GITHUB_TOKEN,
+      # and record nothing a status route would publish.
+      - id: clearance
+        shell: bash
+        env:
+          DIR: ${{ inputs.dir }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          lydite clearance --dir "${DIR}" --event "${GITHUB_EVENT_PATH}" \
+            --status-out "${RUNNER_TEMP}/lydite-status.json"
+          if [ -f "${RUNNER_TEMP}/lydite-status.json" ]; then
+            echo "rendered=true" >> "${GITHUB_OUTPUT}"
+          fi
+
+      - id: relay
+        if: steps.clearance.outputs.rendered == 'true' && inputs.relay != ''
+        shell: bash
+        env:
+          STATUS_FILE: ${{ runner.temp }}/lydite-status.json
+          RELAY: ${{ inputs.relay }}
+        run: |
+          set -euo pipefail
+
+          # The audience is the relay's own origin, so a token minted here
+          # cannot be replayed against another service — and the relay
+          # refuses one whose audience is not its own.
+          token=$(curl -fsS \
+            -H "Authorization: Bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=${RELAY}" | jq -r '.value')
+
+          # The rendered document already carries exactly the fields the
+          # relay's /status route reads — state, context, description, sha,
+          # pull_request — so it is posted as-is rather than reassembled.
+          status=$(curl -sS -o "${RUNNER_TEMP}/relay-out.json" -w '%{http_code}' \
+            -X POST "${RELAY}/status" \
+            -H "Authorization: Bearer ${token}" \
+            -H 'content-type: application/json' \
+            --data-binary "@${STATUS_FILE}") || status=000
+
+          if [ "${status}" = "200" ]; then
+            echo "posted=true" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+          case "${status}" in
+            409)
+              echo "posted=false" >> "${GITHUB_OUTPUT}"
+              echo "the relay answered ${status}; falling back to this workflow's token" >&2
+              ;;
+            000|5??)
+              echo "posted=false" >> "${GITHUB_OUTPUT}"
+              echo "::warning::the relay answered ${status}; falling back to this workflow's token" >&2
+              ;;
+            *)
+              # No `posted` output: the step's own failure is the whole of
+              # what this branch says, and it skips the fallback step below
+              # rather than choosing for it.
+              echo "::error::the relay answered ${status}; this is a configuration problem, not an outage, so it fails the step rather than falling back" >&2
+              cat "${RUNNER_TEMP}/relay-out.json" >&2 || true
+              exit 1
+              ;;
+          esac
+          cat "${RUNNER_TEMP}/relay-out.json" >&2 || true
+
+      - if: steps.clearance.outputs.rendered == 'true' && steps.relay.outputs.posted != 'true'
+        shell: bash
+        env:
+          STATUS_FILE: ${{ runner.temp }}/lydite-status.json
+          REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          sha=$(jq -r '.sha' "${STATUS_FILE}")
+          gh api -X POST "repos/${REPO}/statuses/${sha}" \
+            -f "state=$(jq -r '.state' "${STATUS_FILE}")" \
+            -f "context=$(jq -r '.context' "${STATUS_FILE}")" \
+            -f "description=$(jq -r '.description' "${STATUS_FILE}")" \
+            -f "target_url=$(jq -r '.target_url // \"\"' "${STATUS_FILE}")" \
+            --silent
+          echo "posted the status to ${sha}"
