@@ -5,47 +5,41 @@
 # `issue_comment` run always executes the default branch's own copy of every
 # workflow file, so the deciding logic is never the pull request's to edit.
 #
-# Two jobs, and the split is the whole point of the arrangement:
+# One job, and it runs none of the change's own code. It checks out the pull
+# request's own head — read, never executed: the diff against the merge-base,
+# the exemptions file out of the base commit, a lockfile's own dependency
+# delta. None of that builds anything. What would — an opted-in Rust
+# component's comparison, which runs the head tree's own build.rs and
+# proc-macros — is refused unconditionally by `lydite clearance` itself
+# (`clearedDecision`'s guard against
+# `agentic/rules/give-untrusted-build-scripts-no-inherited-environment.md` in
+# `lydite/lydite`), because this job holds `statuses: write` and
+# `pull-requests: write` on every comment `/lydite` gates it on, whoever posted
+# it. A job that instead computed that comparison here, keyed off nothing
+# stronger than a comment starting with `/lydite`, would run an arbitrary
+# fork's build code in this repository's own context before any permission is
+# checked — the vulnerability this file does not reintroduce.
 #
-#   surfaces ──► clearance     the comparison in a job that can write nothing,
-#                              the decision in the job that writes
+# The consequence is honest, not silent: a component whose comparison runs the
+# change's own code always fingerprints as uncomputable here, exactly as
+# `referral`'s own default path already does for the same consumer (`lydite
+# review --publish`, guarded because it always posts) — this is not a
+# regression against what a repository without the opt-in split already gets.
+# `lydite clearance` takes a `--surfaces <file>` reading a comparison a
+# separate, credential-free job made, for a consumer that builds one; this
+# workflow does not build that job, because doing so safely needs the
+# comparison to run somewhere the change's own code cannot buy it a writing
+# credential or a forged claim, and a comment is not that place.
 #
-# `surfaces` runs `lydite review compare`, which is the only half of the
-# decision that executes any of the change's own code — an opted-in Rust
-# component's comparison builds and runs the head tree's own build.rs and
-# proc-macros. It holds `contents: read` and `pull-requests: read` and nothing
-# else. `id-token: write` is withheld deliberately, not merely unused: a job
-# with no token-request URL in its environment cannot mint an OIDC claim at
-# all, and within one workflow file the relay cannot tell two jobs apart —
-# `pr-relay` admits a gated status by the run's verified `job_workflow_ref`,
-# and both jobs here present the same one. Its checkout carries
-# `persist-credentials: false`, since `actions/checkout` otherwise embeds the
-# token into `.git/config`, where no process-level isolation reaches it.
-#
-# `clearance` holds the writing grants and runs none of the change's own code.
-# It reads the tree — the diff against the merge-base, the exemptions file out
-# of the base commit — and takes every surface comparison from the document
-# `surfaces` uploaded, never by making one. That is why `--surfaces` is passed
-# on every run, including the runs where no document arrived: an absent
-# document is read as *unreadable*, which lydite answers by recording each
-# opted-in component as uncomputable, and passing no flag at all would instead
-# send this job down the in-process comparison path — unguarded, because the
-# guard's test is whether the invocation posts directly and this one renders
-# documents for the steps below. Unreadable is the safe reading; omitting the
-# flag here would run a build script beside `statuses: write`.
-#
-# Both jobs check out the pull request's own head at `refs/pull/<n>/head`, not
-# the default branch. A clearance records the fingerprint of the decision it
-# was given for, and that decision is only the one the person cleared if it is
+# The pull request's own head is checked out at `refs/pull/<n>/head`, not the
+# default branch. A clearance records the fingerprint of the decision it was
+# given for, and that decision is only the one the person cleared if it is
 # recomputed against the revision they read — lydite refuses to fingerprint a
 # checkout that is not the head, and resolves the merge-base from it, which is
-# why `fetch-depth: 0` is not optional here either. The pull request number
-# comes from the event, but the head SHA and the base branch are resolved live
+# why `fetch-depth: 0` is not optional either. The pull request number comes
+# from the event, but the head SHA and the base branch are resolved live
 # through the API rather than read off the comment or the payload's cached
-# copy. `surfaces` reports back the SHA it actually compared, and `clearance`
-# discards the document when that is not the head it checked out — a push
-# between the two jobs leaves a comparison describing another revision, and a
-# comparison of another revision is no evidence about this one.
+# copy.
 #
 # Reading the head tree, rather than the default branch's, has one effect
 # beyond the fingerprint: `/lydite exempt` derives the change's uncovered paths
@@ -100,114 +94,12 @@ on:
         default: ""
 
 jobs:
-  surfaces:
-    name: clearance surfaces
-    # The same gate the deciding job carries, and deliberately no narrower. A
-    # workflow expression cannot parse lydite's own comment grammar — only the
-    # first line counts, leading whitespace is trimmed, `clear` takes an
-    # optional SHA — and a gate that guesses narrower than lydite's parser
-    # skips this job for a comment that really is a clear, which downgrades
-    # that clearance's fingerprint to "the comparison could not be made"
-    # without saying why. Running it for every `/lydite` comment costs a short
-    # job on an explain or an exempt, since `review compare` returns at once
-    # where no component opted into an api_surface comparison.
-    if: >-
-      github.event.issue.pull_request &&
-      startsWith(github.event.comment.body, '/lydite')
-    runs-on: ubuntu-latest
-    # A Rust comparison builds both trees to derive rustdoc JSON, which is the
-    # slowest thing either job does.
-    timeout-minutes: 30
-    permissions:
-      # The tree under comparison, and nothing beyond it. No statuses, no
-      # pull-requests: write, and no id-token — see this file's header for why
-      # the last of those is withheld rather than merely unused.
-      contents: read
-      # Reading the pull request to resolve its head and its base branch. A
-      # private repository answers `GET /repos/:o/:r/pulls/:n` only for a token
-      # that carries it; on a public repository it is redundant.
-      pull-requests: read
-    outputs:
-      # The revision the comparison was actually made against, read off the
-      # checkout rather than asserted before it.
-      compared: ${{ steps.compared.outputs.sha }}
-    steps:
-      # Resolved live through the API, never read from the comment body or
-      # taken from the event payload's copy of the pull request: the payload is
-      # written when the comment is, and the head may have moved since.
-      - id: pr
-        shell: bash
-        env:
-          REPO: ${{ github.repository }}
-          NUMBER: ${{ github.event.issue.number }}
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          gh api "repos/${REPO}/pulls/${NUMBER}" \
-            --jq '"head=" + .head.sha, "base-branch=" + .base.ref' >> "${GITHUB_OUTPUT}"
-
-      # The pull request's own head, including from a fork, which refs/pull is
-      # the only ref that reaches. Full history, because the comparison is made
-      # against the merge-base and a shallow checkout resolves none; no
-      # credentials, because this tree's own build scripts run here.
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          ref: refs/pull/${{ github.event.issue.number }}/head
-          fetch-depth: 0
-          persist-credentials: false
-
-      - id: compared
-        shell: bash
-        run: |
-          set -euo pipefail
-          echo "sha=$(git rev-parse HEAD)" >> "${GITHUB_OUTPUT}"
-
-      - uses: lydite/actions/setup@v1
-        with:
-          version: ${{ inputs.lydite-version }}
-
-      # No token in this step's environment at all: the comparison reaches no
-      # API, and what it does reach is the head tree's own code.
-      - name: compare the public API of every opted-in component
-        shell: bash
-        env:
-          DIR: ${{ inputs.dir }}
-          BASE_BRANCH: ${{ steps.pr.outputs.base-branch }}
-        run: |
-          set -euo pipefail
-          lydite review compare --dir "${DIR}" --base auto \
-            --base-branch "${BASE_BRANCH}" \
-            --write-surfaces "${RUNNER_TEMP}/clearance-surfaces.json"
-
-      # Named for this workflow, and for this half of it: `referral-surfaces`
-      # is a different document, written against a different base by a
-      # different job, and a name shared with it would let either be folded
-      # into the other's decision.
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: clearance-surfaces
-          path: ${{ runner.temp }}/clearance-surfaces.json
-          # `review compare` writes this file or fails, so nothing to upload is
-          # this step reporting a comparison that silently produced no
-          # document — which the deciding job would otherwise read as one
-          # nobody made.
-          if-no-files-found: error
-          # Shorter than the report artifacts a person downloads: this one is
-          # handed to the next job of the same run and read by nothing after.
-          retention-days: 1
-
   clearance:
     name: clearance
-    needs: [surfaces]
-    # The comment is answered whatever the comparison did. A comparison that
-    # failed is evidence of nothing, which is a decision lydite renders; a
-    # commenter told nothing at all is not.
-    #
     # Evaluated before a runner is allocated, so every comment that is not
     # addressed to lydite — which is nearly all of them — costs nothing at
     # all rather than costing a short job.
     if: >-
-      !cancelled() &&
       github.event.issue.pull_request &&
       startsWith(github.event.comment.body, '/lydite')
     runs-on: ubuntu-latest
@@ -236,12 +128,13 @@ jobs:
           gh api "repos/${REPO}/pulls/${NUMBER}" \
             --jq '"base-branch=" + .base.ref' >> "${GITHUB_OUTPUT}"
 
-      # Read, never executed. Every comparison that runs a component's own
-      # build.rs or proc-macro already happened in the `surfaces` job, which
-      # holds no credential; this checkout is only ever read — the diff against
-      # the merge-base, the exemptions file out of the base commit — in a job
-      # that holds statuses: write, so it must not hand the checked-out tree a
-      # credential of its own either.
+      # Read, never executed. This checkout is only ever read — the diff
+      # against the merge-base, the exemptions file out of the base commit —
+      # in a job that holds statuses: write, so it must not hand the
+      # checked-out tree a credential of its own either. Nothing here builds
+      # any of it: a component whose comparison would need to is refused by
+      # `lydite clearance` itself, unconditionally, whether or not this job
+      # also posts — see this file's header.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: refs/pull/${{ github.event.issue.number }}/head
@@ -252,45 +145,14 @@ jobs:
         with:
           version: ${{ inputs.lydite-version }}
 
-      # Best-effort: the comparison job may have failed, and a comment that
-      # clears nothing never needed it. Either way this job still owes the
-      # commenter an answer — it just records a clearance whose every opted-in
-      # component is uncomputable, which is what the missing document says.
-      - name: download the comparison
-        continue-on-error: true
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          name: clearance-surfaces
-          path: ${{ runner.temp }}
-
-      # A comparison describes one revision. A push between the two jobs leaves
-      # a document made against a revision this clearance is not being given
-      # for, and lydite reconciles the document's base without re-checking its
-      # head — so the document is dropped here rather than read, and the
-      # clearance records what a missing comparison records.
-      - name: refuse a comparison of another revision
-        shell: bash
-        env:
-          SURFACES: ${{ runner.temp }}/clearance-surfaces.json
-          COMPARED: ${{ needs.surfaces.outputs.compared }}
-        run: |
-          set -euo pipefail
-          [ -f "${SURFACES}" ] || exit 0
-          at=$(git rev-parse HEAD)
-          if [ "${COMPARED}" != "${at}" ]; then
-            echo "::warning::the comparison was made against ${COMPARED:-nothing}, not ${at}; this clearance records no surface evidence" >&2
-            rm -f "${SURFACES}"
-          fi
-
       # The event payload is read from GITHUB_EVENT_PATH, which the runner
       # sets for every job — not a ${{ }} expression, so this is not the
       # interpolation a run: body must never carry.
       #
-      # --surfaces is passed whether or not the document arrived. A path that
-      # cannot be read is answered by recording every opted-in component as
-      # uncomputable; omitting the flag would instead have this job make the
-      # comparison itself, and this job holds the credential that must never be
-      # in the process a build script runs under.
+      # No --surfaces: this workflow makes no comparison document to read, and
+      # the in-process fallback `lydite clearance` takes instead is guarded
+      # unconditionally regardless — a component whose comparison would run
+      # the change's own code is recorded as uncomputable, never compared.
       #
       # --status-out only ever writes a document for /lydite clear: explain,
       # exempt and refuse reply to the comment directly, through GITHUB_TOKEN,
@@ -305,7 +167,6 @@ jobs:
           set -euo pipefail
           lydite clearance --dir "${DIR}" --event "${GITHUB_EVENT_PATH}" \
             --base auto --base-branch "${BASE_BRANCH}" \
-            --surfaces "${RUNNER_TEMP}/clearance-surfaces.json" \
             --status-out "${RUNNER_TEMP}/lydite-status.json"
           if [ -f "${RUNNER_TEMP}/lydite-status.json" ]; then
             echo "rendered=true" >> "${GITHUB_OUTPUT}"
