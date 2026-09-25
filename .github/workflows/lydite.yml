@@ -165,13 +165,17 @@ jobs:
     # not. Never `failure`, which is the isolation gate and would make the entry
     # permanently unclearable. ADR 0053 in lydite/lydite is the decision.
     #
-    # A relay is required, and this job is skipped without one. The comparison
-    # reads the change's own diff, so it must not hold a credential that can
-    # write a status, which leaves the relay as the only route to one. A
-    # consumer with no relay configured is no worse off than before this job
-    # existed — the queue entry gets no referral, exactly as today — and the fix
-    # is to configure the relay, not to hand this job a token.
-    if: github.event_name == 'merge_group' && inputs.relay != ''
+    # No guard beyond the event. This job is the only publisher of
+    # `lydite/referral` for a queue revision — a commit no earlier run ever
+    # reported under — and a status that is never published is what stalls the
+    # entry forever. A job that runs and fails says so; a job that does not run
+    # is indistinguishable from one that passed.
+    #
+    # That is also why `relay` is not optional here. The comparison reads the
+    # change's own diff, so this job must not hold a credential that can write a
+    # status, which leaves the relay as its only route to one. With no relay
+    # configured the command refuses, loudly, naming what is missing.
+    if: github.event_name == 'merge_group'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
