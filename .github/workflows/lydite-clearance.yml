@@ -4,11 +4,56 @@
 # A caller wires this to `issue_comment`, never to `pull_request`: an
 # `issue_comment` run always executes the default branch's own copy of every
 # workflow file, so the deciding logic is never the pull request's to edit.
-# Nothing here checks out the pull request's code, and nothing here may start
-# doing so — this job holds a writing token, and running code from the branch
-# it is deciding about is how that token would be taken. lydite reads the
-# pull request through the platform's API and never executes anything out of
-# the change.
+#
+# One job, and it runs none of the change's own code. It checks out the pull
+# request's own head — read, never executed: the diff against the merge-base,
+# the exemptions file out of the base commit, a lockfile's own dependency
+# delta. None of that builds anything. What would — an opted-in Rust
+# component's comparison, which runs the head tree's own build.rs and
+# proc-macros — is kept out of this job by the `--surfaces` flag the
+# `clearance` step passes at a path nothing ever writes: a document that
+# cannot be read is recorded as uncomputable rather than absent, on every
+# release of `lydite` that understands the flag, whatever that release's own
+# in-process fallback would otherwise do (`clearedDecision`'s guard against
+# `agentic/rules/give-untrusted-build-scripts-no-inherited-environment.md` in
+# `lydite/lydite` is unconditional only from a given point on, and this
+# workflow declares no floor on `lydite-version`). This job holds
+# `statuses: write` and `pull-requests: write` on every comment `/lydite`
+# gates it on, whoever posted it; a job that instead computed that comparison
+# here, keyed off nothing stronger than a comment starting with `/lydite`,
+# would run an arbitrary fork's build code in this repository's own context
+# before any permission is checked — the vulnerability this file does not
+# reintroduce, and does not leave to the installed binary alone to prevent.
+#
+# The consequence is honest, not silent: a component whose comparison runs the
+# change's own code always fingerprints as uncomputable here, exactly as
+# `referral`'s own default path already does for the same consumer (`lydite
+# review --publish`, guarded because it always posts) — this is not a
+# regression against what a repository without the opt-in split already gets.
+# `lydite clearance` takes a `--surfaces <file>` reading a comparison a
+# separate, credential-free job made, for a consumer that builds one; this
+# workflow does not build that job, because doing so safely needs the
+# comparison to run somewhere the change's own code cannot buy it a writing
+# credential or a forged claim, and a comment is not that place.
+#
+# The pull request's own head is checked out at `refs/pull/<n>/head`, not the
+# default branch. A clearance records the fingerprint of the decision it was
+# given for, and that decision is only the one the person cleared if it is
+# recomputed against the revision they read — lydite refuses to fingerprint a
+# checkout that is not the head, and resolves the merge-base from it, which is
+# why `fetch-depth: 0` is not optional either. The pull request number comes
+# from the event, but the head SHA and the base branch are resolved live
+# through the API rather than read off the comment or the payload's cached
+# copy.
+#
+# Reading the head tree, rather than the default branch's, has one effect
+# beyond the fingerprint: `/lydite exempt` derives the change's uncovered paths
+# through the working tree's own `.lydite/exemptions.yml`, so a pull request
+# that edits that file narrows its own proposal. What that produces is a draft
+# in a comment that lands nothing and that `internal/referral` refuses to parse
+# while it still carries lydite's placeholder reason; the clearance gate itself
+# reads the exemptions file out of the base commit regardless of what is
+# checked out.
 #
 # `/lydite clear` records a document at --status-out; `/lydite explain` and
 # `/lydite exempt <shape>` only reply to the comment, through the job's own
@@ -77,11 +122,29 @@ jobs:
       # credential and grants nothing by itself.
       id-token: write
     steps:
-      # The default branch, which is what an issue_comment event checks out
-      # and what this job must run. Shallow on purpose: the decision is made
-      # from the platform's API rather than from a diff, so no history is
-      # needed.
+      - id: pr
+        shell: bash
+        env:
+          REPO: ${{ github.repository }}
+          NUMBER: ${{ github.event.issue.number }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh api "repos/${REPO}/pulls/${NUMBER}" \
+            --jq '"base-branch=" + .base.ref' >> "${GITHUB_OUTPUT}"
+
+      # Read, never executed. This checkout is only ever read — the diff
+      # against the merge-base, the exemptions file out of the base commit —
+      # in a job that holds statuses: write, so it must not hand the
+      # checked-out tree a credential of its own either. Nothing here builds
+      # any of it: a component whose comparison would need to is refused by
+      # `lydite clearance` itself, unconditionally, whether or not this job
+      # also posts — see this file's header.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: refs/pull/${{ github.event.issue.number }}/head
+          fetch-depth: 0
+          persist-credentials: false
 
       - uses: lydite/actions/setup@v1
         with:
@@ -91,6 +154,21 @@ jobs:
       # sets for every job — not a ${{ }} expression, so this is not the
       # interpolation a run: body must never carry.
       #
+      # --surfaces names a path nothing ever writes to, on purpose: this
+      # workflow makes no comparison document, but the flag is passed anyway
+      # to keep an opted-in component's comparison out of this job whatever
+      # lydite release `lydite-version` resolves to. Given no document, an
+      # unconditional guard is only the *installed binary's* property — this
+      # workflow calls no version floor of its own, and `lydite-version`
+      # defaults to latest but is a caller's own input. Naming a document that
+      # cannot be read takes the same "unreadable, not absent" branch on every
+      # release that understands the flag at all, recording each opted-in
+      # component as uncomputable rather than building it, regardless of what
+      # that release's own in-process fallback would otherwise do. A release
+      # predating the flag entirely refuses it as unrecognised and fails the
+      # step — loudly, not by running the change's own code beside a
+      # credential.
+      #
       # --status-out only ever writes a document for /lydite clear: explain,
       # exempt and refuse reply to the comment directly, through GITHUB_TOKEN,
       # and record nothing a status route would publish.
@@ -98,10 +176,13 @@ jobs:
         shell: bash
         env:
           DIR: ${{ inputs.dir }}
+          BASE_BRANCH: ${{ steps.pr.outputs.base-branch }}
           GITHUB_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           lydite clearance --dir "${DIR}" --event "${GITHUB_EVENT_PATH}" \
+            --base auto --base-branch "${BASE_BRANCH}" \
+            --surfaces "${RUNNER_TEMP}/lydite-clearance-no-comparison.json" \
             --status-out "${RUNNER_TEMP}/lydite-status.json"
           if [ -f "${RUNNER_TEMP}/lydite-status.json" ]; then
             echo "rendered=true" >> "${GITHUB_OUTPUT}"
