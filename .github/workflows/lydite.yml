@@ -119,6 +119,10 @@ concurrency:
 jobs:
   referral:
     name: referral
+    # Not on a merge-queue entry. `review` decides from a pull request's diff
+    # and publishes against that pull request; a `merge_group` run has neither,
+    # so it answers with the queue job below instead.
+    if: github.event_name != 'merge_group'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -144,6 +148,60 @@ jobs:
           # Only on a pull request. This is the half that fixes a stacked
           # pull request, whose base is not the default branch.
           base-branch: ${{ github.event_name == 'pull_request' && github.base_ref || '' }}
+
+  queue:
+    name: queue
+    # A merge queue replays the change onto a fresh base, so the entry's commit
+    # is a revision nobody has cleared, and a `gh-readonly-queue/` ref carries no
+    # pull request for anyone to clear it at. Requiring `lydite/referral` and
+    # enabling a queue were therefore mutually exclusive.
+    #
+    # lydite carries the clearance forward instead. This job recomputes the
+    # decision against the queue's own tree and submits its fingerprint; the
+    # relay resolves the originating pull request live, reads the clearance
+    # standing on that pull request's own head, and writes `lydite/referral` at
+    # the queue revision — `success` carrying the original clearer's attribution
+    # when the reasons are unchanged, `pending` naming what differs when they are
+    # not. Never `failure`, which is the isolation gate and would make the entry
+    # permanently unclearable. ADR 0053 in lydite/lydite is the decision.
+    #
+    # A relay is required, and this job is skipped without one. The comparison
+    # reads the change's own diff, so it must not hold a credential that can
+    # write a status, which leaves the relay as the only route to one. A
+    # consumer with no relay configured is no worse off than before this job
+    # existed — the queue entry gets no referral, exactly as today — and the fix
+    # is to configure the relay, not to hand this job a token.
+    if: github.event_name == 'merge_group' && inputs.relay != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      # Deliberately no `statuses: write`. Mints the Actions OIDC token the
+      # relay authenticates; it is not a credential and grants nothing alone.
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The decision is computed from <merge-base>..HEAD, as on a pull
+          # request. A shallow checkout resolves no merge-base and the run fails
+          # rather than deciding from a diff describing something else.
+          fetch-depth: 0
+
+      - uses: lydite/actions/setup@v1
+        with:
+          version: ${{ inputs.lydite-version }}
+
+      - name: carry the clearance forward
+        shell: bash
+        # Every value reaches the script as an environment variable. A `run:`
+        # body is the one place text is spliced into something a shell executes,
+        # so an expression is never interpolated into one.
+        env:
+          DIR: ${{ inputs.dir }}
+          RELAY: ${{ inputs.relay }}
+        run: |
+          set -euo pipefail
+          lydite clearance queue --dir "${DIR}" --relay "${RELAY}"
 
   scan:
     name: scan
