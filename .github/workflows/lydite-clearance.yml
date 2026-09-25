@@ -10,15 +10,20 @@
 # the exemptions file out of the base commit, a lockfile's own dependency
 # delta. None of that builds anything. What would — an opted-in Rust
 # component's comparison, which runs the head tree's own build.rs and
-# proc-macros — is refused unconditionally by `lydite clearance` itself
-# (`clearedDecision`'s guard against
+# proc-macros — is kept out of this job by the `--surfaces` flag the
+# `clearance` step passes at a path nothing ever writes: a document that
+# cannot be read is recorded as uncomputable rather than absent, on every
+# release of `lydite` that understands the flag, whatever that release's own
+# in-process fallback would otherwise do (`clearedDecision`'s guard against
 # `agentic/rules/give-untrusted-build-scripts-no-inherited-environment.md` in
-# `lydite/lydite`), because this job holds `statuses: write` and
-# `pull-requests: write` on every comment `/lydite` gates it on, whoever posted
-# it. A job that instead computed that comparison here, keyed off nothing
-# stronger than a comment starting with `/lydite`, would run an arbitrary
-# fork's build code in this repository's own context before any permission is
-# checked — the vulnerability this file does not reintroduce.
+# `lydite/lydite` is unconditional only from a given point on, and this
+# workflow declares no floor on `lydite-version`). This job holds
+# `statuses: write` and `pull-requests: write` on every comment `/lydite`
+# gates it on, whoever posted it; a job that instead computed that comparison
+# here, keyed off nothing stronger than a comment starting with `/lydite`,
+# would run an arbitrary fork's build code in this repository's own context
+# before any permission is checked — the vulnerability this file does not
+# reintroduce, and does not leave to the installed binary alone to prevent.
 #
 # The consequence is honest, not silent: a component whose comparison runs the
 # change's own code always fingerprints as uncomputable here, exactly as
@@ -149,10 +154,20 @@ jobs:
       # sets for every job — not a ${{ }} expression, so this is not the
       # interpolation a run: body must never carry.
       #
-      # No --surfaces: this workflow makes no comparison document to read, and
-      # the in-process fallback `lydite clearance` takes instead is guarded
-      # unconditionally regardless — a component whose comparison would run
-      # the change's own code is recorded as uncomputable, never compared.
+      # --surfaces names a path nothing ever writes to, on purpose: this
+      # workflow makes no comparison document, but the flag is passed anyway
+      # to keep an opted-in component's comparison out of this job whatever
+      # lydite release `lydite-version` resolves to. Given no document, an
+      # unconditional guard is only the *installed binary's* property — this
+      # workflow calls no version floor of its own, and `lydite-version`
+      # defaults to latest but is a caller's own input. Naming a document that
+      # cannot be read takes the same "unreadable, not absent" branch on every
+      # release that understands the flag at all, recording each opted-in
+      # component as uncomputable rather than building it, regardless of what
+      # that release's own in-process fallback would otherwise do. A release
+      # predating the flag entirely refuses it as unrecognised and fails the
+      # step — loudly, not by running the change's own code beside a
+      # credential.
       #
       # --status-out only ever writes a document for /lydite clear: explain,
       # exempt and refuse reply to the comment directly, through GITHUB_TOKEN,
@@ -167,6 +182,7 @@ jobs:
           set -euo pipefail
           lydite clearance --dir "${DIR}" --event "${GITHUB_EVENT_PATH}" \
             --base auto --base-branch "${BASE_BRANCH}" \
+            --surfaces "${RUNNER_TEMP}/lydite-clearance-no-comparison.json" \
             --status-out "${RUNNER_TEMP}/lydite-status.json"
           if [ -f "${RUNNER_TEMP}/lydite-status.json" ]; then
             echo "rendered=true" >> "${GITHUB_OUTPUT}"
