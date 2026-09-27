@@ -27,7 +27,7 @@ jobs:
       # block uses a Docker image pinned by digest, with actionlint built
       # into that image at a fixed version, so the commit SHA above pins
       # both the image reference and the actionlint version together.
-      - uses: reviewdog/action-actionlint@8b682e1e7e512151d73a6b9449cbff173846226e # v1.74.0
+      - uses: reviewdog/action-actionlint@320fcdd9c860767cf17fab3b20e22e739d5d02b8 # v1.76.0
         with:
           reporter: local
           fail_level: error
