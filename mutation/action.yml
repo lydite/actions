@@ -42,6 +42,37 @@
 # it is gone, so a completed measurement is recorded without voting on the
 # step's exit code while a not-runnable component or an unresolvable base still
 # fails the job. A pull request passes neither: its gate is the point.
+#
+# A retried job resumes. lydite records every verdict it reaches under
+# `state-dir`, and a rerun measures only the mutants it has no verdict for. The
+# state is a cache, never a ledger: everything in it is reproducible by running
+# the suite again, so a state that cannot be read or written is a diagnostic in
+# the log and never a failed run.
+#
+# The state lives in its own cache entry, outside ~/.cache/lydite. That cache is
+# keyed on the pin manifests, and a cache key is immutable — a hit is never saved
+# over — so verdicts written there on one attempt would never reach the next.
+# It lives outside the checkout too, so no suite or scanner walks it, and never
+# under .lydite-reports, whose contents are the artifact `publish` reads.
+#
+# The key is `lydite-mutation-<os>-<shard>-<sha>-<run_attempt>`. `run_attempt`
+# makes every attempt's key its own, so a retry has a key nothing has saved yet
+# and can write the verdicts it adds; the restore prefix stops before it, so a
+# retry restores the newest entry any earlier attempt at the same commit saved.
+# `<shard>` is `artifact-name`, which names this job's slice of a matrix;
+# `component` is a comma list and does not make a key. `<sha>` is `github.sha`,
+# which on a pull_request run is the synthetic merge commit: a new push, or a
+# base that moved, is a different commit and deliberately restores nothing,
+# because a verdict holds only for the tree it was measured against.
+#
+# `deadline` bounds the run from lydite's own start. A run that reaches it exits
+# 3 having kept every verdict it reached, the step fails the job as any other
+# incomplete run does, and the save step runs regardless under `always()` — so
+# the retry that follows picks up where this attempt stopped.
+#
+# Both flags are passed only when `lydite mutation --help` lists them, so a
+# lydite pinned below them runs exactly as it would without this state; the
+# cache steps are skipped when `--state-dir` is not supported.
 name: lydite mutation
 description: Mutate each component under lydite and upload the reports
 
@@ -106,6 +137,19 @@ inputs:
       shard, each answering about part of the repository under one heading.
     required: false
     default: lydite-reports
+  state-dir:
+    description: >
+      where lydite keeps the verdicts a retried job resumes from; empty resolves
+      to `$RUNNER_TEMP/lydite-mutation-state`. Refused inside the workspace or
+      ~/.cache/lydite.
+    required: false
+    default: ""
+  deadline:
+    description: >
+      how long lydite may run before it stops and keeps the verdicts it reached,
+      as a Go duration (`45m`); empty sets none. A run that reaches it exits 3.
+    required: false
+    default: ""
 
 runs:
   using: composite
@@ -120,8 +164,67 @@ runs:
         key: lydite-${{ runner.os }}-${{ hashFiles('**/.lydite/components.yml', '**/rust-toolchain.toml', '**/package-lock.json', '**/go.sum') }}
         restore-keys: lydite-${{ runner.os }}-
 
-    # Every value reaches the script through env. Interpolating `${{ }}` into a
+    # Every value reaches a script through env. Interpolating `${{ }}` into a
     # run body is a script-injection vector.
+    #
+    # Resolves where the mutation state lives, the shard its cache key names,
+    # and which of the state flags the lydite on PATH understands. The help text
+    # is captured before it is searched: `grep -q` exits at its first match, and
+    # under pipefail the writer it leaves behind would fail the pipeline.
+    - id: state
+      shell: bash
+      env:
+        STATE_DIR_INPUT: ${{ inputs.state-dir }}
+        ARTIFACT_NAME: ${{ inputs.artifact-name }}
+      run: |
+        set -euo pipefail
+        dir="${STATE_DIR_INPUT:-${RUNNER_TEMP}/lydite-mutation-state}"
+        case "${dir}" in
+          /*) ;;
+          *) dir="${GITHUB_WORKSPACE}/${dir}" ;;
+        esac
+        dir="${dir%/}"
+        case "/${dir}/" in
+          */.lydite-reports/*)
+            echo "::error::state-dir ${dir} is under .lydite-reports, which is the reports artifact" >&2
+            exit 1 ;;
+        esac
+        case "${dir}/" in
+          "${GITHUB_WORKSPACE%/}/"*)
+            echo "::error::state-dir ${dir} is inside the workspace; name a directory outside the checkout" >&2
+            exit 1 ;;
+          "${HOME%/}/.cache/lydite/"*)
+            echo "::error::state-dir ${dir} is inside ~/.cache/lydite, whose cache key never takes a new save" >&2
+            exit 1 ;;
+        esac
+        mkdir -p "${dir}"
+        shard="$(printf '%s' "${ARTIFACT_NAME}" | tr -c 'A-Za-z0-9._-' '-')"
+        help="$(lydite mutation --help 2>&1 || true)"
+        state_dir=false
+        deadline=false
+        if grep -q -- '--state-dir' <<<"${help}"; then
+          state_dir=true
+        fi
+        if grep -q -- '--deadline' <<<"${help}"; then
+          deadline=true
+        fi
+        if [ "${state_dir}" != "true" ]; then
+          echo "the lydite on PATH has no --state-dir; a retry of this job measures every mutant again" >&2
+        fi
+        {
+          echo "dir=${dir}"
+          echo "shard=${shard}"
+          echo "supported=${state_dir}"
+          echo "deadline-supported=${deadline}"
+        } >> "${GITHUB_OUTPUT}"
+
+    - if: ${{ steps.state.outputs.supported == 'true' }}
+      uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ${{ steps.state.outputs.dir }}
+        key: lydite-mutation-${{ runner.os }}-${{ steps.state.outputs.shard }}-${{ github.sha }}-${{ github.run_attempt }}
+        restore-keys: lydite-mutation-${{ runner.os }}-${{ steps.state.outputs.shard }}-${{ github.sha }}-
+
     - shell: bash
       env:
         DIR: ${{ inputs.dir }}
@@ -131,6 +234,10 @@ runs:
         BASE_SHA: ${{ inputs.base-sha }}
         NO_GATE: ${{ inputs.no-gate }}
         CONCURRENCY: ${{ inputs.concurrency }}
+        STATE_DIR: ${{ steps.state.outputs.dir }}
+        STATE_SUPPORTED: ${{ steps.state.outputs.supported }}
+        DEADLINE: ${{ inputs.deadline }}
+        DEADLINE_SUPPORTED: ${{ steps.state.outputs.deadline-supported }}
       run: |
         set -euo pipefail
         args=(mutation --dir "${DIR}")
@@ -153,7 +260,26 @@ runs:
         if [ "${NO_GATE}" = "true" ]; then
           args+=(--no-gate)
         fi
+        if [ "${STATE_SUPPORTED}" = "true" ]; then
+          args+=(--state-dir "${STATE_DIR}")
+        fi
+        if [ -n "${DEADLINE}" ]; then
+          if [ "${DEADLINE_SUPPORTED}" = "true" ]; then
+            args+=(--deadline "${DEADLINE}")
+          else
+            echo "::warning::the lydite on PATH has no --deadline; this run is bounded by the job's own timeout alone"
+          fi
+        fi
         lydite "${args[@]}"
+
+    # Saves whatever verdicts this attempt reached, including when the run
+    # failed or stopped at its deadline. The key carries `run_attempt`, so it is
+    # one nothing has saved under yet.
+    - if: ${{ always() && steps.state.outputs.supported == 'true' }}
+      uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ${{ steps.state.outputs.dir }}
+        key: lydite-mutation-${{ runner.os }}-${{ steps.state.outputs.shard }}-${{ github.sha }}-${{ github.run_attempt }}
 
     - id: reports
       if: ${{ always() && inputs.upload-reports == 'true' }}
