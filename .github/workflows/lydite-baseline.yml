@@ -66,6 +66,15 @@ on:
         type: string
         required: false
         default: latest
+      mutation-deadline:
+        description: >
+          how long a mutation shard may run before it stops and keeps the
+          verdicts it reached, as a Go duration. It has to sit below the shard's
+          60-minute timeout by the time setup, the cache restore and save,
+          lydite's teardown and the report upload need; empty sets none.
+        type: string
+        required: false
+        default: "50m"
 
 # One at a time. Two runs recording different trees is fine — they are different
 # keys — but two racing on the same one make the loser retry for nothing, and the
@@ -141,18 +150,25 @@ jobs:
   # `affected` still narrows to what that range touched, exactly as it does on a
   # pull request: there is no reason to mutate a component the merge did not
   # touch merely because the run is now on the default branch. `record` reads
-  # what this job wrote and records nothing for a component absent from it —
-  # untouched, declared `mutation: false`, or a shard this job's own timeout cut
-  # short.
+  # what this job wrote and records nothing for a component it holds no finished
+  # count for — untouched, declared `mutation: false`, stopped by the deadline,
+  # or in a shard this job's own timeout cut short.
   mutate:
     name: mutate (${{ matrix.shard.name }})
     needs: plan
     runs-on: ubuntu-latest
-    # The same ceiling the pull-request mutation matrix runs under: the same
-    # command over a comparable diff is the same expected cost, and a second
-    # number here would assert something nothing has measured. A run that
-    # exceeds it dies here, uploads no document, and `record` records nothing
-    # for the components it never reached.
+    # The same ceiling, and the same `mutation-deadline` inside it, that the
+    # pull-request mutation matrix runs under: the same command over a
+    # comparable diff is the same expected cost, and a second number here would
+    # assert something nothing has measured. A shard that reaches the deadline
+    # uploads a document marking its unfinished components incomplete and fails
+    # the job with exit 3, `no-gate` notwithstanding, and `record` records no
+    # mutation entry for a component left incomplete. It is the same action, so
+    # it keeps its verdicts in the same per-shard, per-commit cache, and a
+    # re-run of this job — which keeps the merge commit as `github.sha` —
+    # resumes from them. A shard that outruns this timeout anyway is killed,
+    # uploads no document, and `record` records nothing for the components it
+    # never reached.
     timeout-minutes: 60
     strategy:
       fail-fast: false
@@ -193,6 +209,7 @@ jobs:
           # than one each out of two.
           artifact-name: ${{ matrix.shard.name }}
           artifact-prefix: lydite-mutation-shard
+          deadline: ${{ inputs.mutation-deadline }}
 
   # What the repository's standing findings are, so the quality history holds a
   # finding count beside the coverage, CRAP and test counts. `record` reads the
