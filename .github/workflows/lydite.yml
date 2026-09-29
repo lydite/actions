@@ -94,6 +94,15 @@ on:
         type: boolean
         required: false
         default: true
+      mutation-deadline:
+        description: >
+          how long a mutation shard may run before it stops and keeps the
+          verdicts it reached, as a Go duration. It has to sit below the shard's
+          60-minute timeout by the time setup, the cache restore and save,
+          lydite's teardown and the report upload need; empty sets none.
+        type: string
+        required: false
+        default: "50m"
       relay:
         description: >
           the comment relay's origin, so the comment arrives as lydite and no
@@ -306,9 +315,16 @@ jobs:
     if: ${{ inputs.mutation }}
     runs-on: ubuntu-latest
     # Longer than the test matrix on purpose: a mutant is a suite run, and a
-    # component's budget is its mutant count times its own suite. Nothing caps
-    # that inside lydite, so a run genuinely too large dies here, the shard
-    # uploads no document, and the fold below reports it as a shard that died.
+    # component's budget is its mutant count times its own suite. The
+    # `mutation-deadline` input caps that inside lydite, short of this timeout:
+    # a shard that reaches it uploads a document marking its unfinished
+    # components incomplete and fails the job — exit 3, or 1 when a survivor it
+    # already found outranks it — and the verdicts it
+    # reached are saved, so a re-run of the failed job at the same commit
+    # resumes from them rather than measuring every mutant again. A shard that
+    # outruns this timeout anyway — no deadline set, or one too close to it —
+    # is killed, uploads no document, and the fold below reports it as a shard
+    # that died.
     timeout-minutes: 60
     strategy:
       fail-fast: false
@@ -345,6 +361,7 @@ jobs:
           # answering about part of the repository under one heading.
           artifact-name: ${{ matrix.shard.name }}
           artifact-prefix: lydite-mutation-shard
+          deadline: ${{ inputs.mutation-deadline }}
 
   # The declined half of the input, and the whole of what it does is write the
   # document saying so. No `needs`, no history and no container runtime:

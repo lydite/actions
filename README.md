@@ -34,7 +34,8 @@ That runs the referral, the scan, the gated suites and the mutation matrix in pa
 renders **one standing comment** from all four. It has to be one run: the comment is assembled
 from every job's reports, so they have to be artifacts of the same run.
 
-Inputs: `dir`, `lydite-version`, `gate-coverage`, `affected`, `mutation`, `relay`. Secret:
+Inputs: `dir`, `lydite-version`, `gate-coverage`, `affected`, `mutation`, `mutation-deadline`,
+`relay`. Secret:
 `semgrep-token`.
 
 **The suites are sharded, and there is nothing to configure.** A `plan` job groups the declared
@@ -61,9 +62,17 @@ checkout and not a compilation, and a `mutation-merge` job folds the shards' doc
 way `merge` does — a component with no row is a shard whose job died, and there is no
 repository-wide figure to compute beyond that, since survived == 0 for every component is
 survived == 0 for the repository. A mutant is a full suite run, so a component's budget is its
-mutant count times its own suite, and nothing inside lydite caps that: the mutation job's timeout
-is 60 minutes, twice the test matrix's 30, and lydite/lydite#97 measured a 1,276-line change at
-54 minutes against it — a large change can run close to that limit.
+mutant count times its own suite. The mutation job's timeout is 60 minutes, twice the test
+matrix's 30, and lydite/lydite#97 measured a 1,276-line change at 54 minutes against it — a large
+change can run close to that limit.
+
+**A deadline stops a shard before that timeout does.** `mutation-deadline` (default `50m`, a Go
+duration; empty means none) is passed to each shard. A shard reaching it uploads an incomplete
+document and fails the job (lydite exits 3), and the verdicts it had reached are saved to the
+Actions cache. Re-running the failed job at the same commit restores them and measures only what is
+left. A new push restores nothing: `github.sha` on a `pull_request` is the synthetic merge commit,
+so every push keys its own state. A shard that outruns the 60-minute timeout anyway is killed
+before it uploads, and contributes no document at all.
 
 `mutation: false` declines the whole matrix in favour of a single `mutation-declined` job, which
 costs no mutants run and no coverage-of-mutants signal for that run. The comment still gets a
@@ -88,7 +97,7 @@ jobs:
       contents: write   # the recording job pushes to the `lydite` branch
 ```
 
-Inputs: `dir`, `lydite-version`.
+Inputs: `dir`, `lydite-version`, `mutation-deadline`.
 
 **It is a separate workflow because recording is a push, and the job that measures runs your
 code.** `lydite test` writes nothing to the `lydite` branch: it reads a baseline, gates against
@@ -124,8 +133,8 @@ contribution whether the merge landed as a squash or as a true two-parent commit
 could fix it is gone, so the measurement is recorded without voting on the step's exit code, while
 a component that could not be mutated at all still fails the job. `record` folds those documents in
 beside the measurements and the finding count, and records nothing for a component absent from them
-— untouched by the merge, declared `mutation: false`, or held by a shard the 60-minute ceiling cut
-short.
+— untouched by the merge, declared `mutation: false`, stopped by the deadline, or held by a shard
+the 60-minute ceiling cut short.
 
 ## Or the pieces
 
@@ -168,6 +177,18 @@ different wiring than a sharded one to fold correctly.
     gate-coverage: true
     affected: true
 ```
+
+`mutation@v1` takes two inputs beyond the shard's components. `deadline` is a Go duration after
+which lydite stops, keeps the verdicts it has and exits 3; empty means none. `state-dir` (default
+`$RUNNER_TEMP/lydite-mutation-state`) is where those verdicts live between runs, restored with
+`actions/cache/restore` before lydite runs and saved with `actions/cache/save` after it under
+`always()`, so a failed or deadline-stopped run still saves. The key is
+`lydite-mutation-<os>-<shard>-<sha>-<run_attempt>`, restored by the prefix without the attempt. The
+directory must lie outside the checkout, outside `~/.cache/lydite` — whose cache key is immutable
+and never refreshes, so state kept there would never be saved again — and outside
+`.lydite-reports`, which is uploaded; the action refuses any of them. Both flags reach lydite only
+when `lydite mutation --help` lists them, which takes lydite v0.4.0 or later; an older lydite runs
+with neither.
 
 Sharding by hand is a `plan` job whose output a matrix reads. `plan` is pure — it opens the
 declaration and each component's compose file and nothing else — so this job needs no history
